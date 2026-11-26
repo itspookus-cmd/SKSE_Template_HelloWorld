@@ -170,7 +170,7 @@ namespace
             }
 
             const int  value = entry->GetValue();
-            const bool enchanted = entry->GetEnchantment() != nullptr || weapon->formEnchanting != nullptr;
+            const bool enchanted = entry->IsEnchanted() || weapon->formEnchanting != nullptr;
             const bool artifact = g_settings.artifactsAreLegendary && weapon->HasKeywordString("DaedricArtifact");
 
             if (artifact || value >= g_settings.legendaryMinValue) {
@@ -302,6 +302,17 @@ namespace
     // ---------------------------------------------------------------
     //  Turning the glow on and off
     // ---------------------------------------------------------------
+
+    // Asks the game itself to play an effect on an object. (Older versions of the
+    // library don't include this, so we call the game's own function directly,
+    // the same way newer versions of the library do.)
+    RE::ShaderReferenceEffect* PlayShader(RE::TESObjectREFR* a_ref, RE::TESEffectShader* a_shader, float a_duration)
+    {
+        using func_t = RE::ShaderReferenceEffect* (*)(RE::TESObjectREFR*, RE::TESEffectShader*, float,
+            RE::TESObjectREFR*, bool, bool, RE::NiAVObject*, bool);
+        static REL::Relocation<func_t> func{ RELOCATION_ID(19446, 19872) };
+        return func(a_ref, a_shader, a_duration, nullptr, false, false, nullptr, false);
+    }
     bool IsChest(RE::TESObjectREFR* a_ref)
     {
         if (!a_ref || a_ref->IsDisabled() || a_ref->IsMarkedForDeletion()) {
@@ -356,7 +367,7 @@ namespace
         }
 
         if (shader) {
-            a_chest->ApplyEffectShader(shader, -1.0f);  // -1 = glow until we remove it
+            PlayShader(a_chest, shader, -1.0f);  // -1 = glow until we remove it
             if (g_settings.showConsoleMessages) {
                 RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest: %s",
                     rarity == Rarity::kLegendary ? "Legendary" : "Epic", a_chest->GetName());
