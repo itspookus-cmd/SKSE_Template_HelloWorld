@@ -8,48 +8,58 @@
 //    3. Whenever items move in or out of a chest, look again, so the
 //       glow goes away once you take the weapon.
 //
-//  All the numbers and colors live in ChestGlow.ini, so you can tweak
-//  them without rebuilding.
+//  Settings live in ChestGlow.ini. If SKSE Menu Framework is installed,
+//  they can also be changed in-game from its menu.
 // =====================================================================
 
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdarg>
 #include <fstream>
 #include <initializer_list>
+#include <mutex>
 #include <set>
 #include <sstream>
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace
 {
+    constexpr auto INI_PATH = "Data/SKSE/Plugins/ChestGlow.ini";
+
     // ---------------------------------------------------------------
     //  A tiny log file: Data/SKSE/Plugins/ChestGlow.log
     //  (With Mod Organizer 2 it lands in the "overwrite" folder.)
     // ---------------------------------------------------------------
     void Log(const std::string& a_text)
     {
+        static std::mutex    lock;
         static std::ofstream file("Data/SKSE/Plugins/ChestGlow.log", std::ios::trunc);
+        std::scoped_lock     guard(lock);
         if (file) {
             file << a_text << std::endl;
         }
     }
 
     // ---------------------------------------------------------------
-    //  Settings (defaults here; ChestGlow.ini overrides them)
+    //  Settings (defaults here; ChestGlow.ini and the menu change them)
     // ---------------------------------------------------------------
     struct Settings
     {
-        int  legendaryMinValue = 2000;  // weapons worth this much gold or more are Legendary
+        bool enabled = true;
+
+        int  legendaryMinValue = 2000;      // weapons worth this much gold or more are Legendary
         bool artifactsAreLegendary = true;  // Daedric artifacts always count as Legendary
-        int  epicMinValue = 500;  // enchanted weapons worth this much or more are Epic
+        int  epicMinValue = 500;            // enchanted weapons worth this much or more are Epic
         bool epicMustBeEnchanted = true;
 
         RE::Color legendaryColor{ 255, 200, 0, 255 };  // yellow
         RE::Color epicColor{ 170, 60, 255, 255 };      // purple
-        float     glowStrength = 1.0f;   // 0.0 (faint) to 1.0 (strong)
-        float     pulseSpeed = 1.0f;     // how fast the glow breathes; 0 = steady
+        float     glowStrength = 1.0f;                  // 0.0 (faint) to 1.0 (strong)
+        float     pulseSpeed = 1.0f;                    // how fast the glow breathes; 0 = steady
 
         bool showConsoleMessages = false;  // print to the ~ console when a chest glows
 
@@ -63,6 +73,12 @@ namespace
         auto notSpace = [](unsigned char c) { return !std::isspace(c); };
         a_text.erase(a_text.begin(), std::find_if(a_text.begin(), a_text.end(), notSpace));
         a_text.erase(std::find_if(a_text.rbegin(), a_text.rend(), notSpace).base(), a_text.end());
+        return a_text;
+    }
+
+    std::string ToLower(std::string a_text)
+    {
+        std::transform(a_text.begin(), a_text.end(), a_text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
         return a_text;
     }
 
@@ -85,9 +101,14 @@ namespace
             static_cast<std::uint8_t>(values[2]), 255);
     }
 
+    std::string ColorToText(const RE::Color& a_color)
+    {
+        return std::to_string(a_color.red) + ", " + std::to_string(a_color.green) + ", " + std::to_string(a_color.blue);
+    }
+
     void LoadSettings()
     {
-        std::ifstream file("Data/SKSE/Plugins/ChestGlow.ini");
+        std::ifstream file(INI_PATH);
         if (!file) {
             Log("ChestGlow.ini not found, using default settings.");
             return;
@@ -104,9 +125,7 @@ namespace
             if (eq == std::string::npos) {
                 continue;
             }
-            auto key = Trim(line.substr(0, eq));
-            std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            values[key] = Trim(line.substr(eq + 1));
+            values[ToLower(Trim(line.substr(0, eq)))] = Trim(line.substr(eq + 1));
         }
 
         auto getInt = [&](const char* a_key, int a_fallback) {
@@ -122,8 +141,7 @@ namespace
         auto getBool = [&](const char* a_key, bool a_fallback) {
             auto it = values.find(a_key);
             if (it == values.end()) return a_fallback;
-            auto v = it->second;
-            std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            auto v = ToLower(it->second);
             return v == "1" || v == "true" || v == "yes" || v == "on";
         };
         auto getColor = [&](const char* a_key, RE::Color a_fallback) {
@@ -131,6 +149,7 @@ namespace
             return it == values.end() ? a_fallback : ParseColor(it->second, a_fallback);
         };
 
+        g_settings.enabled = getBool("enabled", g_settings.enabled);
         g_settings.legendaryMinValue = getInt("legendaryminvalue", g_settings.legendaryMinValue);
         g_settings.artifactsAreLegendary = getBool("artifactsarelegendary", g_settings.artifactsAreLegendary);
         g_settings.epicMinValue = getInt("epicminvalue", g_settings.epicMinValue);
@@ -148,6 +167,47 @@ namespace
             " gold, Epic >= " + std::to_string(g_settings.epicMinValue) + " gold.");
     }
 
+    bool SaveSettings()
+    {
+        std::ofstream file(INI_PATH, std::ios::trunc);
+        if (!file) {
+            Log("ERROR: could not save ChestGlow.ini.");
+            return false;
+        }
+        auto b = [](bool a_value) { return a_value ? "true" : "false"; };
+        file << "; =========================================================\n"
+             << ";  Chest Glow settings (saved from the in-game menu)\n"
+             << ";  Edit with Notepad or in-game. Lines starting with ; are notes.\n"
+             << "; =========================================================\n\n"
+             << "[General]\n"
+             << "; Turn the whole mod on or off.\n"
+             << "Enabled = " << b(g_settings.enabled) << "\n\n"
+             << "[Rarity]\n"
+             << "; A weapon worth this much gold or more counts as LEGENDARY.\n"
+             << "LegendaryMinValue = " << g_settings.legendaryMinValue << "\n"
+             << "; Daedric artifacts always count as Legendary.\n"
+             << "ArtifactsAreLegendary = " << b(g_settings.artifactsAreLegendary) << "\n"
+             << "; A weapon worth this much gold or more counts as EPIC.\n"
+             << "EpicMinValue = " << g_settings.epicMinValue << "\n"
+             << "; If true, an Epic weapon must also be enchanted.\n"
+             << "EpicMustBeEnchanted = " << b(g_settings.epicMustBeEnchanted) << "\n\n"
+             << "[Glow]\n"
+             << "; Colors as Red, Green, Blue (each 0 to 255).\n"
+             << "LegendaryColor = " << ColorToText(g_settings.legendaryColor) << "\n"
+             << "EpicColor = " << ColorToText(g_settings.epicColor) << "\n"
+             << "; How bright the glow is, from 0.0 (faint) to 1.0 (strong).\n"
+             << "GlowStrength = " << g_settings.glowStrength << "\n"
+             << "; How fast the glow gently pulses. 0 = steady glow.\n"
+             << "PulseSpeed = " << g_settings.pulseSpeed << "\n"
+             << "; Leave empty for the automatic pick, or paste a texture name from ChestGlow.log.\n"
+             << "GlowTexture = " << g_settings.glowTexture << "\n\n"
+             << "[Debug]\n"
+             << "; If true, the ~ console prints a line each time a chest starts glowing.\n"
+             << "ShowConsoleMessages = " << b(g_settings.showConsoleMessages) << "\n";
+        Log("Settings saved to ChestGlow.ini.");
+        return true;
+    }
+
     // ---------------------------------------------------------------
     //  Rarity rules
     // ---------------------------------------------------------------
@@ -158,9 +218,38 @@ namespace
         kLegendary
     };
 
-    Rarity GetChestRarity(RE::TESObjectREFR* a_chest)
+    const char* RarityName(Rarity a_rarity)
     {
-        Rarity best = Rarity::kNone;
+        switch (a_rarity) {
+        case Rarity::kLegendary:
+            return "Legendary";
+        case Rarity::kEpic:
+            return "Epic";
+        default:
+            return "None";
+        }
+    }
+
+    struct ChestReport
+    {
+        Rarity      rarity = Rarity::kNone;
+        std::string chestName;
+        std::string weaponName;  // the weapon that decided the color
+        int         weaponValue = 0;
+        bool        weaponEnchanted = false;
+        bool        weaponIsArtifact = false;
+        int         weaponsFound = 0;
+    };
+
+    // What the menu shows under "Last chest checked".
+    std::mutex  g_reportLock;
+    ChestReport g_lastReport;
+    bool        g_hasReport = false;
+
+    ChestReport CheckChest(RE::TESObjectREFR* a_chest)
+    {
+        ChestReport report;
+        report.chestName = a_chest->GetName() ? a_chest->GetName() : "";
 
         // Only look at weapons.
         auto inventory = a_chest->GetInventory([](RE::TESBoundObject& a_obj) { return a_obj.IsWeapon(); });
@@ -170,24 +259,34 @@ namespace
             if (count <= 0 || !entry) {
                 continue;
             }
-
             auto* weapon = object->As<RE::TESObjectWEAP>();
             if (!weapon) {
                 continue;
             }
+            ++report.weaponsFound;
 
             const int  value = entry->GetValue();
             const bool enchanted = entry->IsEnchanted() || weapon->formEnchanting != nullptr;
             const bool artifact = g_settings.artifactsAreLegendary && weapon->HasKeywordString("DaedricArtifact");
 
+            Rarity rarity = Rarity::kNone;
             if (artifact || value >= g_settings.legendaryMinValue) {
-                return Rarity::kLegendary;  // can't do better than this, stop looking
+                rarity = Rarity::kLegendary;
+            } else if (value >= g_settings.epicMinValue && (enchanted || !g_settings.epicMustBeEnchanted)) {
+                rarity = Rarity::kEpic;
             }
-            if (value >= g_settings.epicMinValue && (enchanted || !g_settings.epicMustBeEnchanted)) {
-                best = Rarity::kEpic;
+
+            // Keep the best weapon (highest tier, then highest value) as the "reason".
+            const bool better = rarity > report.rarity || (rarity == report.rarity && value > report.weaponValue);
+            if (better || report.weaponName.empty()) {
+                report.rarity = std::max(report.rarity, rarity);
+                report.weaponName = weapon->GetName() ? weapon->GetName() : "(unnamed)";
+                report.weaponValue = value;
+                report.weaponEnchanted = enchanted;
+                report.weaponIsArtifact = artifact;
             }
         }
-        return best;
+        return report;
     }
 
     // ---------------------------------------------------------------
@@ -195,6 +294,7 @@ namespace
     // ---------------------------------------------------------------
     RE::TESEffectShader* g_legendaryShader = nullptr;
     RE::TESEffectShader* g_epicShader = nullptr;
+    std::string          g_textureInUse;
 
     // Find a vanilla glow effect to borrow textures from, so ours renders properly.
     RE::TESEffectShader* FindTemplateShader()
@@ -226,8 +326,7 @@ namespace
                 continue;
             }
             std::string original = shader->fillTexture.textureName.c_str();
-            std::string name = original;
-            std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            std::string name = ToLower(original);
 
             if (seen.insert(name).second) {
                 Log("  " + original);
@@ -251,6 +350,41 @@ namespace
         return preferred ? preferred : fallback;
     }
 
+    // Applies our color, brightness and pulse settings to a glow effect.
+    void ApplyLook(RE::TESEffectShader* a_shader, RE::Color a_color)
+    {
+        if (!a_shader) {
+            return;
+        }
+        auto& d = a_shader->data;
+
+        d.fillTextureEffectColorKey1 = a_color;
+        d.fillTextureEffectColorKey2 = a_color;
+        d.fillTextureEffectColorKey3 = a_color;
+        d.edgeEffectColor = a_color;
+        d.edgeColor = a_color;
+
+        // Fade in quickly, then stay on (persistent) with a gentle pulse.
+        const float strength = g_settings.glowStrength;
+        const float pulse = g_settings.pulseSpeed > 0.0f ? strength * 0.3f : 0.0f;
+
+        d.fillTextureEffectAlphaFadeInTime = 0.5f;
+        d.fillTextureEffectFullAlphaTime = 0.0f;
+        d.fillTextureEffectAlphaFadeOutTime = 0.5f;
+        d.fillTextureEffectFullAlphaRatio = strength;
+        d.fillTextureEffectPersistentAlphaRatio = strength * 0.6f;
+        d.fillTextureEffectAlphaPulseAmplitude = pulse;
+        d.fillTextureEffectAlphaPulseFrequency = g_settings.pulseSpeed;
+
+        d.edgeEffectAlphaFadeInTime = 0.5f;
+        d.edgeEffectFullAlphaTime = 0.0f;
+        d.edgeEffectAlphaFadeOutTime = 0.5f;
+        d.edgeEffectFullAlphaRatio = strength;
+        d.edgeEffectPersistentAlphaRatio = strength;
+        d.edgeEffectAlphaPulseAmplitude = pulse;
+        d.edgeEffectAlphaPulseFrequency = g_settings.pulseSpeed;
+    }
+
     RE::TESEffectShader* MakeGlowShader(RE::TESEffectShader* a_template, RE::Color a_color)
     {
         auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESEffectShader>();
@@ -262,7 +396,7 @@ namespace
             return nullptr;
         }
 
-        // Start from the vanilla effect's settings and textures...
+        // Start from the vanilla effect's settings and texture...
         shader->data = a_template->data;
         shader->fillTexture.textureName = a_template->fillTexture.textureName;
         if (!g_settings.glowTexture.empty()) {
@@ -281,31 +415,6 @@ namespace
         d.flags.reset(RE::EffectShaderData::Flags::kSkinOnly, RE::EffectShaderData::Flags::kIgnoreWeapons);
         d.addonModels = nullptr;
         d.ambientSound = nullptr;
-
-        // Color everything in our chosen color.
-        d.fillTextureEffectColorKey1 = a_color;
-        d.fillTextureEffectColorKey2 = a_color;
-        d.fillTextureEffectColorKey3 = a_color;
-        d.edgeEffectColor = a_color;
-        d.edgeColor = a_color;
-
-        // Fade in quickly, then stay on (persistent) with a gentle pulse.
-        const float strength = g_settings.glowStrength;
-        d.fillTextureEffectAlphaFadeInTime = 0.5f;
-        d.fillTextureEffectFullAlphaTime = 0.0f;
-        d.fillTextureEffectAlphaFadeOutTime = 0.5f;
-        d.fillTextureEffectFullAlphaRatio = strength;
-        d.fillTextureEffectPersistentAlphaRatio = strength * 0.6f;
-        d.fillTextureEffectAlphaPulseAmplitude = g_settings.pulseSpeed > 0.0f ? strength * 0.3f : 0.0f;
-        d.fillTextureEffectAlphaPulseFrequency = g_settings.pulseSpeed;
-
-        d.edgeEffectAlphaFadeInTime = 0.5f;
-        d.edgeEffectFullAlphaTime = 0.0f;
-        d.edgeEffectAlphaFadeOutTime = 0.5f;
-        d.edgeEffectFullAlphaRatio = strength;
-        d.edgeEffectPersistentAlphaRatio = strength;
-        d.edgeEffectAlphaPulseAmplitude = g_settings.pulseSpeed > 0.0f ? strength * 0.3f : 0.0f;
-        d.edgeEffectAlphaPulseFrequency = g_settings.pulseSpeed;
         if (d.edgeEffectFallOff <= 0.0f) {
             d.edgeEffectFallOff = 1.0f;
         }
@@ -313,6 +422,7 @@ namespace
             d.colorScale = 1.0f;
         }
 
+        ApplyLook(shader, a_color);
         return shader;
     }
 
@@ -324,13 +434,15 @@ namespace
             return false;
         }
         Log(std::string("Borrowing settings from the effect with texture: ") + templ->fillTexture.textureName.c_str());
+        g_textureInUse = templ->fillTexture.textureName.c_str();
         if (!g_settings.glowTexture.empty()) {
             Log("Using your GlowTexture from ChestGlow.ini instead: " + g_settings.glowTexture);
+            g_textureInUse = g_settings.glowTexture;
         }
 
         g_legendaryShader = MakeGlowShader(templ, g_settings.legendaryColor);
         g_epicShader = MakeGlowShader(templ, g_settings.epicColor);
-        if (!g_legendaryShader || !g_epicShader) {
+        if (!g_legendaryShader || !g_epicShader || g_legendaryShader == g_epicShader) {
             Log("ERROR: could not create the glow effects.");
             return false;
         }
@@ -352,6 +464,7 @@ namespace
         static REL::Relocation<func_t> func{ RELOCATION_ID(19446, 19872) };
         return func(a_ref, a_shader, a_duration, nullptr, false, false, nullptr, false);
     }
+
     bool IsChest(RE::TESObjectREFR* a_ref)
     {
         if (!a_ref || a_ref->IsDisabled() || a_ref->IsMarkedForDeletion()) {
@@ -385,6 +498,9 @@ namespace
         });
     }
 
+    // Chests currently loaded in the world, so the menu can refresh them all.
+    std::unordered_set<RE::FormID> g_loadedChests;  // only touched on the main thread
+
     void UpdateChest(RE::TESObjectREFR* a_chest)
     {
         if (!g_legendaryShader || !g_epicShader || !IsChest(a_chest)) {
@@ -393,23 +509,30 @@ namespace
 
         RemoveGlow(a_chest);
 
-        if (!a_chest->Is3DLoaded()) {
-            return;  // not visible yet; we'll check again when it loads
+        if (!g_settings.enabled || !a_chest->Is3DLoaded()) {
+            return;  // switched off, or not visible yet (we'll check again when it loads)
+        }
+        g_loadedChests.insert(a_chest->GetFormID());
+
+        const ChestReport report = CheckChest(a_chest);
+        if (report.weaponsFound > 0) {
+            std::scoped_lock guard(g_reportLock);
+            g_lastReport = report;
+            g_hasReport = true;
         }
 
-        const Rarity rarity = GetChestRarity(a_chest);
         RE::TESEffectShader* shader = nullptr;
-        if (rarity == Rarity::kLegendary) {
+        if (report.rarity == Rarity::kLegendary) {
             shader = g_legendaryShader;
-        } else if (rarity == Rarity::kEpic) {
+        } else if (report.rarity == Rarity::kEpic) {
             shader = g_epicShader;
         }
 
         if (shader) {
             PlayShader(a_chest, shader, -1.0f);  // -1 = glow until we remove it
             if (g_settings.showConsoleMessages) {
-                RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest: %s",
-                    rarity == Rarity::kLegendary ? "Legendary" : "Epic", a_chest->GetName());
+                RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest '%s' because of '%s' (%d gold)",
+                    RarityName(report.rarity), report.chestName.c_str(), report.weaponName.c_str(), report.weaponValue);
             }
         }
     }
@@ -427,19 +550,51 @@ namespace
         }
     }
 
+    // Re-applies the colors/brightness and re-checks every loaded chest.
+    // Used by the menu; the work itself happens on the main thread.
+    std::atomic<bool> g_refreshQueued{ false };
+
+    void QueueRefreshAll()
+    {
+        if (g_refreshQueued.exchange(true)) {
+            return;  // one is already waiting
+        }
+        if (auto* tasks = SKSE::GetTaskInterface()) {
+            tasks->AddTask([]() {
+                g_refreshQueued = false;
+                ApplyLook(g_legendaryShader, g_settings.legendaryColor);
+                ApplyLook(g_epicShader, g_settings.epicColor);
+                const auto chests = g_loadedChests;  // copy: UpdateChest may change the list
+                for (auto id : chests) {
+                    UpdateChest(RE::TESForm::LookupByID<RE::TESObjectREFR>(id));
+                }
+            });
+        } else {
+            g_refreshQueued = false;
+        }
+    }
+
     // ---------------------------------------------------------------
     //  Listening to game events
     // ---------------------------------------------------------------
 
-    // Fires when an object's 3D model loads, e.g. you walk into a room with a chest.
+    // Fires when an object's 3D model loads or unloads, e.g. you walk into a room with a chest.
     class ObjectLoadedListener : public RE::BSTEventSink<RE::TESObjectLoadedEvent>
     {
     public:
         RE::BSEventNotifyControl ProcessEvent(const RE::TESObjectLoadedEvent* a_event,
             RE::BSTEventSource<RE::TESObjectLoadedEvent>*) override
         {
-            if (a_event && a_event->loaded) {
+            if (!a_event) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            if (a_event->loaded) {
                 QueueUpdate(a_event->formID);
+            } else {
+                const auto id = a_event->formID;
+                if (auto* tasks = SKSE::GetTaskInterface()) {
+                    tasks->AddTask([id]() { g_loadedChests.erase(id); });
+                }
             }
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -463,6 +618,185 @@ namespace
     ObjectLoadedListener     g_objectLoadedListener;
     ContainerChangedListener g_containerChangedListener;
 
+    // ---------------------------------------------------------------
+    //  In-game settings page (only if SKSE Menu Framework is installed)
+    //
+    //  SKSE Menu Framework shares the functions it uses to draw menus.
+    //  We look them up by name, so there is nothing extra to build or link.
+    // ---------------------------------------------------------------
+    namespace Menu
+    {
+        struct Vec2
+        {
+            float x, y;
+        };
+        struct Vec4
+        {
+            float x, y, z, w;
+        };
+
+        SKSE::WinAPI::HMODULE g_framework = nullptr;
+
+        template <class T>
+        T Find(const char* a_name)
+        {
+            return g_framework ? reinterpret_cast<T>(SKSE::WinAPI::GetProcAddress(g_framework, a_name)) : nullptr;
+        }
+
+        // The drawing functions we use.
+        using TextV_t = void (*)(const char*, va_list);
+        using TextColoredV_t = void (*)(Vec4, const char*, va_list);
+        using Button_t = bool (*)(const char*, Vec2);
+        using Checkbox_t = bool (*)(const char*, bool*);
+        using SliderInt_t = bool (*)(const char*, int*, int, int, const char*, int);
+        using SliderFloat_t = bool (*)(const char*, float*, float, float, const char*, int);
+        using ColorEdit3_t = bool (*)(const char*, float*, int);
+        using Void_t = void (*)();
+        using SeparatorText_t = void (*)(const char*);
+        using SameLine_t = void (*)(float, float);
+        using AddSectionItem_t = void (*)(const char*, void (*)());
+
+        TextV_t         g_textWrappedV = nullptr;
+        TextColoredV_t  g_textColoredV = nullptr;
+        Button_t        g_button = nullptr;
+        Checkbox_t      g_checkbox = nullptr;
+        SliderInt_t     g_sliderInt = nullptr;
+        SliderFloat_t   g_sliderFloat = nullptr;
+        ColorEdit3_t    g_colorEdit3 = nullptr;
+        Void_t          g_spacing = nullptr;
+        SeparatorText_t g_separatorText = nullptr;
+        SameLine_t      g_sameLine = nullptr;
+
+        void Text(const char* a_fmt, ...)
+        {
+            va_list args;
+            va_start(args, a_fmt);
+            g_textWrappedV(a_fmt, args);
+            va_end(args);
+        }
+
+        void TextColored(Vec4 a_color, const char* a_fmt, ...)
+        {
+            va_list args;
+            va_start(args, a_fmt);
+            g_textColoredV(a_color, a_fmt, args);
+            va_end(args);
+        }
+
+        // Color pickers work with 0-1 numbers; the game uses 0-255.
+        bool ColorPicker(const char* a_label, RE::Color& a_color)
+        {
+            float rgb[3] = { a_color.red / 255.0f, a_color.green / 255.0f, a_color.blue / 255.0f };
+            if (!g_colorEdit3(a_label, rgb, 0)) {
+                return false;
+            }
+            a_color = RE::Color(static_cast<std::uint8_t>(std::clamp(rgb[0], 0.0f, 1.0f) * 255.0f + 0.5f),
+                static_cast<std::uint8_t>(std::clamp(rgb[1], 0.0f, 1.0f) * 255.0f + 0.5f),
+                static_cast<std::uint8_t>(std::clamp(rgb[2], 0.0f, 1.0f) * 255.0f + 0.5f), 255);
+            return true;
+        }
+
+        std::string g_saveMessage;
+
+        void Render()
+        {
+            bool changed = false;
+
+            g_separatorText("General");
+            changed |= g_checkbox("Mod enabled", &g_settings.enabled);
+            g_checkbox("Print a console line when a chest glows", &g_settings.showConsoleMessages);
+
+            g_separatorText("What counts as Legendary (yellow)");
+            changed |= g_sliderInt("Legendary: minimum gold value", &g_settings.legendaryMinValue, 100, 20000, "%d", 0);
+            changed |= g_checkbox("Daedric artifacts are always Legendary", &g_settings.artifactsAreLegendary);
+
+            g_separatorText("What counts as Epic (purple)");
+            changed |= g_sliderInt("Epic: minimum gold value", &g_settings.epicMinValue, 50, 10000, "%d", 0);
+            changed |= g_checkbox("Epic weapons must be enchanted", &g_settings.epicMustBeEnchanted);
+            if (g_settings.epicMinValue >= g_settings.legendaryMinValue) {
+                TextColored({ 1.0f, 0.6f, 0.2f, 1.0f },
+                    "Note: Epic's minimum is not lower than Legendary's, so nothing can be Epic.");
+            }
+
+            g_separatorText("Glow look");
+            changed |= ColorPicker("Legendary color", g_settings.legendaryColor);
+            changed |= ColorPicker("Epic color", g_settings.epicColor);
+            changed |= g_sliderFloat("Brightness", &g_settings.glowStrength, 0.0f, 1.0f, "%.2f", 0);
+            changed |= g_sliderFloat("Pulse speed (0 = steady)", &g_settings.pulseSpeed, 0.0f, 5.0f, "%.1f", 0);
+            Text("Texture in use: %s", g_textureInUse.c_str());
+            Text("(To change the texture, edit GlowTexture in ChestGlow.ini and restart the game.)");
+
+            if (changed) {
+                QueueRefreshAll();  // see the result right away on nearby chests
+            }
+
+            g_spacing();
+            if (g_button("Save settings", { 0.0f, 0.0f })) {
+                g_saveMessage = SaveSettings() ? "Saved." : "Could not save. Check ChestGlow.log.";
+            }
+            g_sameLine(0.0f, -1.0f);
+            if (g_button("Re-check nearby chests", { 0.0f, 0.0f })) {
+                QueueRefreshAll();
+            }
+            if (!g_saveMessage.empty()) {
+                Text("%s", g_saveMessage.c_str());
+            }
+            Text("Changes apply right away. Press Save to keep them for next time.");
+
+            g_separatorText("Last chest checked (for testing)");
+            ChestReport report;
+            bool        has = false;
+            {
+                std::scoped_lock guard(g_reportLock);
+                report = g_lastReport;
+                has = g_hasReport;
+            }
+            if (!has) {
+                Text("No chest with weapons checked yet. Walk near one, or add a weapon to one.");
+            } else {
+                const Vec4 color = report.rarity == Rarity::kLegendary ? Vec4{ 1.0f, 0.8f, 0.0f, 1.0f } :
+                                   report.rarity == Rarity::kEpic      ? Vec4{ 0.7f, 0.3f, 1.0f, 1.0f } :
+                                                                         Vec4{ 0.7f, 0.7f, 0.7f, 1.0f };
+                Text("Chest: %s", report.chestName.c_str());
+                TextColored(color, "Result: %s", RarityName(report.rarity));
+                Text("Best weapon inside: %s", report.weaponName.c_str());
+                Text("Its value: %d gold  |  Enchanted: %s  |  Daedric artifact: %s", report.weaponValue,
+                    report.weaponEnchanted ? "yes" : "no", report.weaponIsArtifact ? "yes" : "no");
+            }
+        }
+
+        void Register()
+        {
+            // (CommonLib turns this name into its own Windows helper.)
+            g_framework = GetModuleHandle(L"SKSEMenuFramework");
+            if (!g_framework) {
+                Log("SKSE Menu Framework not found, so there is no in-game menu. (Settings still work from ChestGlow.ini.)");
+                return;
+            }
+
+            g_textWrappedV = Find<TextV_t>("igTextWrappedV");
+            g_textColoredV = Find<TextColoredV_t>("igTextColoredV");
+            g_button = Find<Button_t>("igButton");
+            g_checkbox = Find<Checkbox_t>("igCheckbox");
+            g_sliderInt = Find<SliderInt_t>("igSliderInt");
+            g_sliderFloat = Find<SliderFloat_t>("igSliderFloat");
+            g_colorEdit3 = Find<ColorEdit3_t>("igColorEdit3");
+            g_spacing = Find<Void_t>("igSpacing");
+            g_separatorText = Find<SeparatorText_t>("igSeparatorText");
+            g_sameLine = Find<SameLine_t>("igSameLine");
+            auto addSectionItem = Find<AddSectionItem_t>("AddSectionItem");
+
+            if (!g_textWrappedV || !g_textColoredV || !g_button || !g_checkbox || !g_sliderInt || !g_sliderFloat ||
+                !g_colorEdit3 || !g_spacing || !g_separatorText || !g_sameLine || !addSectionItem) {
+                Log("ERROR: this version of SKSE Menu Framework is missing something we need, so there is no in-game menu.");
+                return;
+            }
+
+            addSectionItem("Chest Glow/Settings", Render);
+            Log("Added the Chest Glow page to SKSE Menu Framework.");
+        }
+    }
+
     void OnDataLoaded()
     {
         LoadSettings();
@@ -477,6 +811,8 @@ namespace
         events->AddEventSink<RE::TESObjectLoadedEvent>(&g_objectLoadedListener);
         events->AddEventSink<RE::TESContainerChangedEvent>(&g_containerChangedListener);
         Log("Chest Glow is running.");
+
+        Menu::Register();
     }
 }
 
