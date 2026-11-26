@@ -1,0 +1,33 @@
+name: Build plugin
+
+# Runs every time you save (commit) a change, and you can also start it by hand
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get your code
+        uses: actions/checkout@v4
+
+      - name: Point the build at the vcpkg that GitHub already installed
+        shell: pwsh
+        run: |
+          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Turn on the Microsoft C++ compiler
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Configure
+        run: cmake --preset release
+
+      - name: Build
+        run: cmake --build build/release
+
+      - name: Save the finished .dll so you can download it
+        uses: actions/upload-artifact@v4
+        with:
+          name: plugin-dll
+          path: build/release/*.dll
