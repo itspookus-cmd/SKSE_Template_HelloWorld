@@ -7,18 +7,27 @@ on:
 
 jobs:
   build:
-    runs-on: windows-latest
+    # Older Windows image with Visual Studio 2022, which matches this template
+    runs-on: windows-2022
+    env:
+      # Lets older libraries build even if the machine has a very new CMake
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - name: Get your code
         uses: actions/checkout@v4
 
+      - name: Install the Ninja build tool
+        shell: pwsh
+        run: choco install ninja -y --no-progress
+
+      - name: Turn on the Microsoft C++ compiler
+        uses: ilammy/msvc-dev-cmd@v1
+
+      # This must come AFTER the compiler step, which otherwise overwrites it
       - name: Point the build at the vcpkg that GitHub already installed
         shell: pwsh
         run: |
           "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
-
-      - name: Turn on the Microsoft C++ compiler
-        uses: ilammy/msvc-dev-cmd@v1
 
       - name: Configure
         run: cmake --preset release
@@ -31,3 +40,12 @@ jobs:
         with:
           name: plugin-dll
           path: build/release/*.dll
+
+      - name: On failure, save the detailed logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: failure-logs
+          path: |
+            build/release/vcpkg-manifest-install.log
+            build/release/vcpkg_installed/vcpkg/blds/**/*.log
