@@ -35,11 +35,18 @@ jobs:
       - name: Build
         run: cmake --build build/release
 
-      - name: Save the finished .dll so you can download it
+      - name: Package the mod (ready to install with a mod manager)
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path package/SKSE/Plugins | Out-Null
+          Copy-Item build/release/*.dll package/SKSE/Plugins/
+          if (Test-Path ChestGlow.ini) { Copy-Item ChestGlow.ini package/SKSE/Plugins/ }
+
+      - name: Save the finished mod so you can download it
         uses: actions/upload-artifact@v4
         with:
-          name: plugin-dll
-          path: build/release/*.dll
+          name: ChestGlow-mod
+          path: package/
 
       - name: On failure, save the detailed logs
         if: failure()
