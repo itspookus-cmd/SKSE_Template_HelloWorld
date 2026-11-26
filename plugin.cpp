@@ -15,6 +15,8 @@
 #include <algorithm>
 #include <cctype>
 #include <fstream>
+#include <initializer_list>
+#include <set>
 #include <sstream>
 #include <string>
 #include <type_traits>
@@ -50,6 +52,8 @@ namespace
         float     pulseSpeed = 1.0f;     // how fast the glow breathes; 0 = steady
 
         bool showConsoleMessages = false;  // print to the ~ console when a chest glows
+
+        std::string glowTexture;  // optional: a texture path to use instead of the automatic pick
     };
 
     Settings g_settings;
@@ -136,6 +140,9 @@ namespace
         g_settings.glowStrength = std::clamp(getFloat("glowstrength", g_settings.glowStrength), 0.0f, 1.0f);
         g_settings.pulseSpeed = std::max(0.0f, getFloat("pulsespeed", g_settings.pulseSpeed));
         g_settings.showConsoleMessages = getBool("showconsolemessages", g_settings.showConsoleMessages);
+        if (auto it = values.find("glowtexture"); it != values.end()) {
+            g_settings.glowTexture = it->second;
+        }
 
         Log("Settings loaded. Legendary >= " + std::to_string(g_settings.legendaryMinValue) +
             " gold, Epic >= " + std::to_string(g_settings.epicMinValue) + " gold.");
@@ -197,7 +204,20 @@ namespace
             return nullptr;
         }
 
-        RE::TESEffectShader* fallback = nullptr;
+        auto containsAny = [](const std::string& a_text, std::initializer_list<const char*> a_words) {
+            for (auto* word : a_words) {
+                if (a_text.find(word) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        RE::TESEffectShader*  preferred = nullptr;
+        RE::TESEffectShader*  fallback = nullptr;
+        std::set<std::string> seen;
+
+        Log("Textures you can use for GlowTexture in ChestGlow.ini:");
         for (auto* shader : dataHandler->GetFormArray<RE::TESEffectShader>()) {
             if (!shader || shader->fillTexture.textureName.empty()) {
                 continue;
@@ -205,19 +225,30 @@ namespace
             if (shader->data.flags.any(RE::EffectShaderData::Flags::kDisableTextureShader)) {
                 continue;
             }
-            std::string name = shader->fillTexture.textureName.c_str();
+            std::string original = shader->fillTexture.textureName.c_str();
+            std::string name = original;
             std::transform(name.begin(), name.end(), name.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
 
-            // Plain white/grey textures tint cleanly to any color, so prefer those.
-            if (name.find("white") != std::string::npos || name.find("grey") != std::string::npos ||
-                name.find("gray") != std::string::npos) {
-                return shader;
+            if (seen.insert(name).second) {
+                Log("  " + original);
+            }
+
+            // Skip elemental textures (lightning, fire, ice...). They have their own
+            // strong colors and patterns that drown out ours.
+            if (containsAny(name, { "shock", "lightning", "fire", "flame", "frost", "ice", "blood", "burn", "lava",
+                                      "smoke", "poison", "spark", "drain", "absorb" })) {
+                continue;
+            }
+
+            // Plain, soft textures tint cleanly to any color, so prefer those.
+            if (!preferred && containsAny(name, { "white", "grey", "gray", "glow", "blank", "gradient", "soft", "smooth" })) {
+                preferred = shader;
             }
             if (!fallback) {
                 fallback = shader;
             }
         }
-        return fallback;
+        return preferred ? preferred : fallback;
     }
 
     RE::TESEffectShader* MakeGlowShader(RE::TESEffectShader* a_template, RE::Color a_color)
@@ -234,11 +265,16 @@ namespace
         // Start from the vanilla effect's settings and textures...
         shader->data = a_template->data;
         shader->fillTexture.textureName = a_template->fillTexture.textureName;
-        shader->membranePaletteTexture.textureName = a_template->membranePaletteTexture.textureName;
+        if (!g_settings.glowTexture.empty()) {
+            shader->fillTexture.textureName = g_settings.glowTexture.c_str();
+        }
+        // No borrowed color palette: it would override our colors.
+        shader->membranePaletteTexture.textureName = "";
         shader->holesTexture.textureName = "";
         shader->particleShaderTexture.textureName = "";
 
         auto& d = shader->data;
+        d.flags.reset(RE::EffectShaderData::Flags::kGreyscaleToColor);
 
         // ...then turn off sparkle particles and debris, which would look messy on chests.
         d.flags.set(RE::EffectShaderData::Flags::kDisableParticleShader);
@@ -287,7 +323,10 @@ namespace
             Log("ERROR: could not find a vanilla effect to base the glow on.");
             return false;
         }
-        Log(std::string("Using vanilla effect texture: ") + templ->fillTexture.textureName.c_str());
+        Log(std::string("Borrowing settings from the effect with texture: ") + templ->fillTexture.textureName.c_str());
+        if (!g_settings.glowTexture.empty()) {
+            Log("Using your GlowTexture from ChestGlow.ini instead: " + g_settings.glowTexture);
+        }
 
         g_legendaryShader = MakeGlowShader(templ, g_settings.legendaryColor);
         g_epicShader = MakeGlowShader(templ, g_settings.epicColor);
