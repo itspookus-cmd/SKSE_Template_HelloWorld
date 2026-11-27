@@ -78,6 +78,11 @@ namespace
         };
         bool artifactsAreLegendary = true;  // Daedric artifacts always count as Legendary
 
+        bool  seamLight = true;         // true = light from the lid seam, false = whole chest glows
+        float lightRadius = 200.0f;     // how far the seam light reaches (game units)
+        float lightBrightness = 1.5f;   // how bright the seam light is
+        float seamHeight = 0.6f;        // where the seam is, as a share of the chest's height (0 = bottom, 1 = top)
+
         float     glowStrength = 1.0f;                  // 0.0 (faint) to 1.0 (strong)
         float     pulseSpeed = 1.0f;                    // how fast the glow breathes; 0 = steady
 
@@ -183,6 +188,12 @@ namespace
             tier.color = getColor((key + "color").c_str(), tier.color);
         }
         g_settings.artifactsAreLegendary = getBool("artifactsarelegendary", g_settings.artifactsAreLegendary);
+        if (auto it = values.find("glowstyle"); it != values.end()) {
+            g_settings.seamLight = ToLower(it->second) != "whole";
+        }
+        g_settings.lightRadius = std::clamp(getFloat("lightradius", g_settings.lightRadius), 30.0f, 1000.0f);
+        g_settings.lightBrightness = std::clamp(getFloat("lightbrightness", g_settings.lightBrightness), 0.1f, 10.0f);
+        g_settings.seamHeight = std::clamp(getFloat("seamheight", g_settings.seamHeight), 0.0f, 1.0f);
         g_settings.glowStrength = std::clamp(getFloat("glowstrength", g_settings.glowStrength), 0.0f, 1.0f);
         g_settings.pulseSpeed = std::max(0.0f, getFloat("pulsespeed", g_settings.pulseSpeed));
         g_settings.showConsoleMessages = getBool("showconsolemessages", g_settings.showConsoleMessages);
@@ -233,7 +244,14 @@ namespace
              << "; Daedric artifacts always count as Legendary, whatever their value.\n"
              << "ArtifactsAreLegendary = " << b(g_settings.artifactsAreLegendary) << "\n\n"
              << "[Glow]\n"
-             << "; How bright the glow is, from 0.0 (faint) to 1.0 (strong).\n"
+             << "; Seam = light shines from the chest's lid seam. Whole = the whole chest glows.\n"
+             << "GlowStyle = " << (g_settings.seamLight ? "Seam" : "Whole") << "\n"
+             << "; Seam light: how far it reaches (about 70 = 1 meter) and how bright it is.\n"
+             << "LightRadius = " << g_settings.lightRadius << "\n"
+             << "LightBrightness = " << g_settings.lightBrightness << "\n"
+             << "; Where the seam is, as a share of the chest's height (0 = bottom, 1 = top).\n"
+             << "SeamHeight = " << g_settings.seamHeight << "\n"
+             << "; Whole-chest glow: how bright the glow is, from 0.0 (faint) to 1.0 (strong).\n"
              << "GlowStrength = " << g_settings.glowStrength << "\n"
              << "; How fast the glow gently pulses. 0 = steady glow.\n"
              << "PulseSpeed = " << g_settings.pulseSpeed << "\n"
@@ -523,6 +541,141 @@ namespace
         return func(a_ref, a_shader, a_duration, nullptr, false, false, nullptr, false);
     }
 
+    // ---------------------------------------------------------------
+    //  Seam light: a real colored light placed at the chest's lid seam.
+    //  It's attached to the chest's 3D model, so it's never saved into
+    //  your save file and disappears with the chest's model.
+    // ---------------------------------------------------------------
+    RE::TESObjectLIGH* g_lightForms[TIER_COUNT] = {};
+
+    void ApplyLightLook(RE::TESObjectLIGH* a_light, RE::Color a_color)
+    {
+        if (!a_light) {
+            return;
+        }
+        a_light->data.color = a_color;
+        a_light->data.radius = static_cast<std::uint32_t>(g_settings.lightRadius);
+        a_light->data.fallofExponent = 1.0f;
+        a_light->fade = g_settings.lightBrightness;
+    }
+
+    bool CreateLightForms()
+    {
+        auto* factory = RE::IFormFactory::GetConcreteFormFactoryByType<RE::TESObjectLIGH>();
+        if (!factory) {
+            return false;
+        }
+        for (int i = 0; i < TIER_COUNT; ++i) {
+            g_lightForms[i] = static_cast<RE::TESObjectLIGH*>(factory->Create());
+            ApplyLightLook(g_lightForms[i], g_settings.tiers[i].color);
+        }
+        return std::all_of(std::begin(g_lightForms), std::end(g_lightForms), [](auto* l) { return l != nullptr; });
+    }
+
+    // The game's own functions (same ones Light Placer uses).
+    RE::NiAVObject* GenDynamicLight(RE::TESObjectLIGH* a_light, RE::TESObjectREFR* a_ref, RE::NiNode* a_node)
+    {
+        using func_t = RE::NiAVObject* (*)(RE::TESObjectLIGH*, RE::TESObjectREFR*, RE::NiNode*, char, char, char);
+        static REL::Relocation<func_t> func{ RELOCATION_ID(17208, 17610) };
+        return func(a_light, a_ref, a_node, true, true, false);
+    }
+
+    void RemoveFromLighting(RE::NiAVObject* a_light)
+    {
+        static REL::Relocation<void**> shaderState{ RELOCATION_ID(513211, 390951) };  // BSShaderManager::State
+        auto* shadowSceneNode = shaderState.get() ? shaderState.get()[0] : nullptr;   // its first member
+        if (!shadowSceneNode || !a_light) {
+            return;
+        }
+        using func_t = void (*)(void*, RE::NiAVObject*);
+        static REL::Relocation<func_t> func{ RELOCATION_ID(99697, 106331) };  // ShadowSceneNode::RemoveLight
+        func(shadowSceneNode, a_light);
+    }
+
+    struct SeamLight
+    {
+        RE::NiPointer<RE::NiNode>     node;
+        RE::NiPointer<RE::NiAVObject> light;
+        RE::NiAVObject*               root = nullptr;  // the chest model it was attached to
+        int                           tier = NO_TIER;
+    };
+    std::unordered_map<RE::FormID, SeamLight> g_seamLights;  // main thread only
+
+    void RemoveSeamLight(RE::FormID a_chestID)
+    {
+        auto it = g_seamLights.find(a_chestID);
+        if (it == g_seamLights.end()) {
+            return;
+        }
+        auto& entry = it->second;
+        if (entry.light) {
+            RemoveFromLighting(entry.light.get());
+        }
+        if (entry.node && entry.node->parent) {
+            entry.node->parent->DetachChild(entry.node.get());
+        }
+        g_seamLights.erase(it);
+    }
+
+    void RemoveAllSeamLights()
+    {
+        std::vector<RE::FormID> ids;
+        for (auto& [id, entry] : g_seamLights) {
+            ids.push_back(id);
+        }
+        for (auto id : ids) {
+            RemoveSeamLight(id);
+        }
+    }
+
+    // Is this chest's seam light still in place? (Its model may have reloaded.)
+    bool SeamLightValid(RE::TESObjectREFR* a_chest, const SeamLight& a_entry)
+    {
+        return a_entry.node && a_entry.node->parent && a_chest->Get3D() == a_entry.root;
+    }
+
+    void AddSeamLight(RE::TESObjectREFR* a_chest, int a_tier)
+    {
+        auto* model = a_chest->Get3D();
+        auto* root = model ? model->AsNode() : nullptr;
+        auto* base = a_chest->GetBaseObject();
+        if (!root || !base || !g_lightForms[a_tier]) {
+            return;
+        }
+
+        // Find the seam from the chest's size: centered, at SeamHeight of its height.
+        const auto& bounds = base->boundData;
+        float minZ = bounds.boundMin.z;
+        float maxZ = bounds.boundMax.z;
+        if (maxZ <= minZ) {
+            minZ = 0.0f;
+            maxZ = 40.0f;  // unknown size: assume a normal chest
+        }
+
+        auto* node = RE::NiNode::Create(1);
+        if (!node) {
+            return;
+        }
+        node->name = "ChestGlowSeamLight";
+        node->local.translate.x = (bounds.boundMin.x + bounds.boundMax.x) * 0.5f;
+        node->local.translate.y = (bounds.boundMin.y + bounds.boundMax.y) * 0.5f;
+        node->local.translate.z = minZ + (maxZ - minZ) * g_settings.seamHeight;
+        root->AttachChild(node, true);
+
+        RE::NiUpdateData update{};
+        node->Update(update);
+
+        auto* light = GenDynamicLight(g_lightForms[a_tier], a_chest, node);
+        node->Update(update);
+
+        SeamLight entry;
+        entry.node.reset(node);
+        entry.light.reset(light);
+        entry.root = model;
+        entry.tier = a_tier;
+        g_seamLights[a_chest->GetFormID()] = std::move(entry);
+    }
+
     bool IsChest(RE::TESObjectREFR* a_ref)
     {
         if (!a_ref || a_ref->IsDisabled() || a_ref->IsMarkedForDeletion()) {
@@ -535,6 +688,9 @@ namespace
     // Removes any of OUR glows from this chest (never touches other mods' effects).
     void RemoveGlow(RE::TESObjectREFR* a_chest)
     {
+        if (a_chest) {
+            RemoveSeamLight(a_chest->GetFormID());
+        }
         auto* processLists = RE::ProcessLists::GetSingleton();
         if (!processLists) {
             return;
@@ -582,7 +738,11 @@ namespace
     {
         RemoveGlow(a_chest);
         if (a_tier < TIER_COUNT) {
-            PlayShader(a_chest, g_shaders[a_tier], -1.0f);  // -1 = glow until we remove it
+            if (g_settings.seamLight) {
+                AddSeamLight(a_chest, a_tier);
+            } else {
+                PlayShader(a_chest, g_shaders[a_tier], -1.0f);  // -1 = glow until we remove it
+            }
             if (g_settings.showConsoleMessages) {
                 RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest '%s' because of '%s' (%d gold)",
                     TierName(a_tier), a_report.chestName.c_str(), a_report.weaponName.c_str(), a_report.weaponValue);
@@ -676,6 +836,20 @@ namespace
             }
             return RE::BSContainer::ForEachResult::kContinue;
         });
+
+        // Seam lights (dropping any whose chest model went away).
+        std::vector<RE::FormID> stale;
+        for (auto& [id, entry] : g_seamLights) {
+            auto* chest = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+            if (chest && SeamLightValid(chest, entry)) {
+                result[chest] = entry.tier;
+            } else {
+                stale.push_back(id);
+            }
+        }
+        for (auto id : stale) {
+            RemoveSeamLight(id);
+        }
         return result;
     }
 
@@ -792,6 +966,7 @@ namespace
             tasks->AddTask([]() {
                 for (int i = 0; i < TIER_COUNT; ++i) {
                     ApplyLook(g_shaders[i], g_settings.tiers[i].color);
+                    ApplyLightLook(g_lightForms[i], g_settings.tiers[i].color);
                 }
                 ScanNearby(true);
             });
@@ -858,6 +1033,7 @@ namespace
                         g_nearbyContainers.insert(id);
                     } else {
                         g_nearbyContainers.erase(id);
+                        RemoveSeamLight(id);
                     }
                 });
             }
@@ -1010,7 +1186,15 @@ namespace
                 g_popID();
             }
 
-            g_separatorText("Glow look");
+            g_separatorText("Glow style");
+            changed |= g_checkbox("Light from the lid seam (untick: whole chest glows)", &g_settings.seamLight);
+
+            g_separatorText("Seam light");
+            changed |= g_sliderFloat("Light reach", &g_settings.lightRadius, 30.0f, 1000.0f, "%.0f", 0);
+            changed |= g_sliderFloat("Light brightness", &g_settings.lightBrightness, 0.1f, 10.0f, "%.1f", 0);
+            changed |= g_sliderFloat("Seam height (0 = bottom, 1 = top)", &g_settings.seamHeight, 0.0f, 1.0f, "%.2f", 0);
+
+            g_separatorText("Whole-chest glow");
             changed |= g_sliderFloat("Brightness", &g_settings.glowStrength, 0.0f, 1.0f, "%.2f", 0);
             changed |= g_sliderFloat("Pulse speed (0 = steady)", &g_settings.pulseSpeed, 0.0f, 5.0f, "%.1f", 0);
             Text("Texture in use: %s", g_textureInUse.c_str());
@@ -1101,6 +1285,10 @@ namespace
         if (!CreateShaders()) {
             return;
         }
+        if (!CreateLightForms()) {
+            Log("ERROR: could not create the seam lights. Switching to whole-chest glow.");
+            g_settings.seamLight = false;
+        }
         auto* events = RE::ScriptEventSourceHolder::GetSingleton();
         if (!events) {
             Log("ERROR: could not access game events.");
@@ -1128,6 +1316,8 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse)
             break;
         case SKSE::MessagingInterface::kPreLoadGame:
             g_inWorld = false;  // pause scanning while a save loads
+            RemoveAllSeamLights();
+            g_nearbyContainers.clear();
             break;
         case SKSE::MessagingInterface::kPostLoadGame:
         case SKSE::MessagingInterface::kNewGame:
