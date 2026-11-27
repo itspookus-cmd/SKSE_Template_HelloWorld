@@ -78,9 +78,11 @@ namespace
         };
         bool artifactsAreLegendary = true;  // Daedric artifacts always count as Legendary
 
-        bool  seamLight = true;         // true = light from the lid seam, false = whole chest glows
-        float lightRadius = 200.0f;     // how far the seam light reaches (game units)
-        float lightBrightness = 1.5f;   // how bright the seam light is
+        bool  seamLight = true;           // true = glowing seam with rays, false = whole chest glows
+        float seamGlowStrength = 2.0f;    // how bright the seam glow and rays are
+        bool  lightSurroundings = false;  // also shine real light onto the floor and walls
+        float lightRadius = 200.0f;       // how far that light reaches (game units)
+        float lightBrightness = 1.5f;     // how bright that light is
         float seamHeight = 0.6f;        // where the seam is, as a share of the chest's height (0 = bottom, 1 = top)
 
         float     glowStrength = 1.0f;                  // 0.0 (faint) to 1.0 (strong)
@@ -191,6 +193,8 @@ namespace
         if (auto it = values.find("glowstyle"); it != values.end()) {
             g_settings.seamLight = ToLower(it->second) != "whole";
         }
+        g_settings.seamGlowStrength = std::clamp(getFloat("seamglowstrength", g_settings.seamGlowStrength), 0.1f, 10.0f);
+        g_settings.lightSurroundings = getBool("lightsurroundings", g_settings.lightSurroundings);
         g_settings.lightRadius = std::clamp(getFloat("lightradius", g_settings.lightRadius), 30.0f, 1000.0f);
         g_settings.lightBrightness = std::clamp(getFloat("lightbrightness", g_settings.lightBrightness), 0.1f, 10.0f);
         g_settings.seamHeight = std::clamp(getFloat("seamheight", g_settings.seamHeight), 0.0f, 1.0f);
@@ -244,9 +248,13 @@ namespace
              << "; Daedric artifacts always count as Legendary, whatever their value.\n"
              << "ArtifactsAreLegendary = " << b(g_settings.artifactsAreLegendary) << "\n\n"
              << "[Glow]\n"
-             << "; Seam = light shines from the chest's lid seam. Whole = the whole chest glows.\n"
+             << "; Seam = glowing line and rays from the chest's lid seam. Whole = the whole chest glows.\n"
              << "GlowStyle = " << (g_settings.seamLight ? "Seam" : "Whole") << "\n"
-             << "; Seam light: how far it reaches (about 70 = 1 meter) and how bright it is.\n"
+             << "; How bright the seam glow and rays are.\n"
+             << "SeamGlowStrength = " << g_settings.seamGlowStrength << "\n"
+             << "; Also shine real colored light onto the floor and walls around the chest.\n"
+             << "LightSurroundings = " << b(g_settings.lightSurroundings) << "\n"
+             << "; That light: how far it reaches (about 70 = 1 meter) and how bright it is.\n"
              << "LightRadius = " << g_settings.lightRadius << "\n"
              << "LightBrightness = " << g_settings.lightBrightness << "\n"
              << "; Where the seam is, as a share of the chest's height (0 = bottom, 1 = top).\n"
@@ -634,46 +642,146 @@ namespace
         return a_entry.node && a_entry.node->parent && a_chest->Get3D() == a_entry.root;
     }
 
-    void AddSeamLight(RE::TESObjectREFR* a_chest, int a_tier)
+    // ---- The glowing seam model (meshes\ChestGlow\Seam<Tier>.nif) ----
+    const char* SEAM_MODELS[TIER_COUNT] = {
+        "ChestGlow\\SeamLegendary.nif",
+        "ChestGlow\\SeamEpic.nif",
+        "ChestGlow\\SeamCommon.nif",
+    };
+    RE::NiPointer<RE::NiNode> g_seamTemplates[TIER_COUNT];
+    bool                      g_seamModelMissing = false;
+
+    // The game's own model loader and copier (same ones Light Placer uses).
+    RE::NiNode* LoadModel(const char* a_path)
+    {
+        struct Args  // BSModelDB::DBTraits::ArgsType
+        {
+            std::uint32_t lodMult{ 0 };
+            std::uint32_t texLoadLevel{ 3 };
+            bool          unk8{ true };
+            bool          unk9{ false };
+            bool          unkA{ true };
+            bool          postProcess{ true };
+        };
+        static_assert(sizeof(Args) == 0xC);
+        using func_t = std::uint32_t (*)(const char*, RE::NiPointer<RE::NiNode>&, const Args&);
+        static REL::Relocation<func_t> func{ RELOCATION_ID(74040, 75782) };  // BSModelDB::Demand
+
+        RE::NiPointer<RE::NiNode> model;
+        const Args                args{};
+        if (func(a_path, model, args) != 0 || !model) {
+            return nullptr;
+        }
+        auto* result = model.get();
+        result->IncRefCount();  // keep it alive after 'model' goes away
+        return result;
+    }
+
+    RE::NiAVObject* CloneModel(RE::NiAVObject* a_model)
+    {
+        using func_t = RE::NiObject* (*)(RE::NiObject*);
+        static REL::Relocation<func_t> func{ RELOCATION_ID(68835, 70187) };  // NiObject::Clone
+        return static_cast<RE::NiAVObject*>(func(a_model));
+    }
+
+    RE::NiNode* GetSeamTemplate(int a_tier)
+    {
+        if (!g_seamTemplates[a_tier] && !g_seamModelMissing) {
+            auto* model = LoadModel(SEAM_MODELS[a_tier]);
+            if (!model) {
+                g_seamModelMissing = true;
+                Log(std::string("ERROR: could not load meshes\\") + SEAM_MODELS[a_tier] +
+                    ". Is the Chest Glow assets folder installed? Using whole-chest glow instead.");
+                return nullptr;
+            }
+            g_seamTemplates[a_tier].reset(model);
+            model->DecRefCount();  // the NiPointer holds it now
+            Log(std::string("Loaded seam model ") + SEAM_MODELS[a_tier]);
+        }
+        return g_seamTemplates[a_tier].get();
+    }
+
+    // Recolors every glowing part of a seam model.
+    void ColorSeamModel(RE::NiAVObject* a_model, RE::Color a_color)
+    {
+        RE::BSVisit::TraverseScenegraphGeometries(a_model, [&](RE::BSGeometry* a_geometry) {
+            auto& props = a_geometry->GetGeometryRuntimeData().properties;
+            auto* shader = netimmerse_cast<RE::BSEffectShaderProperty*>(props[RE::BSGeometry::States::kEffect].get());
+            if (shader && shader->material) {
+                auto* material = static_cast<RE::BSEffectShaderMaterial*>(shader->material);
+                material->baseColor.red = a_color.red / 255.0f;
+                material->baseColor.green = a_color.green / 255.0f;
+                material->baseColor.blue = a_color.blue / 255.0f;
+                material->baseColor.alpha = 1.0f;
+                material->baseColorScale = g_settings.seamGlowStrength;
+            }
+            return RE::BSVisit::BSVisitControl::kContinue;
+        });
+    }
+
+    // Adds the seam glow (and, if turned on, a real light) to a chest. Returns false if
+    // the seam model isn't available, so the caller can fall back to the whole-chest glow.
+    bool AddSeamLight(RE::TESObjectREFR* a_chest, int a_tier)
     {
         auto* model = a_chest->Get3D();
         auto* root = model ? model->AsNode() : nullptr;
         auto* base = a_chest->GetBaseObject();
-        if (!root || !base || !g_lightForms[a_tier]) {
-            return;
+        auto* seamTemplate = GetSeamTemplate(a_tier);
+        if (!root || !base || !seamTemplate) {
+            return false;
         }
 
         // Find the seam from the chest's size: centered, at SeamHeight of its height.
         const auto& bounds = base->boundData;
-        float minZ = bounds.boundMin.z;
-        float maxZ = bounds.boundMax.z;
-        if (maxZ <= minZ) {
-            minZ = 0.0f;
-            maxZ = 40.0f;  // unknown size: assume a normal chest
+        float minX = bounds.boundMin.x, maxX = bounds.boundMax.x;
+        float minY = bounds.boundMin.y, maxY = bounds.boundMax.y;
+        float minZ = bounds.boundMin.z, maxZ = bounds.boundMax.z;
+        if (maxX <= minX || maxY <= minY || maxZ <= minZ) {
+            minX = -30.0f, maxX = 30.0f, minY = -16.0f, maxY = 16.0f, minZ = 0.0f, maxZ = 34.0f;  // unknown: a normal chest
         }
 
-        auto* node = RE::NiNode::Create(1);
-        if (!node) {
-            return;
+        // 'holder' sits at the seam. The light (if any) goes here.
+        auto* holder = RE::NiNode::Create(2);
+        if (!holder) {
+            return false;
         }
-        node->name = "ChestGlowSeamLight";
-        node->local.translate.x = (bounds.boundMin.x + bounds.boundMax.x) * 0.5f;
-        node->local.translate.y = (bounds.boundMin.y + bounds.boundMax.y) * 0.5f;
-        node->local.translate.z = minZ + (maxZ - minZ) * g_settings.seamHeight;
-        root->AttachChild(node, true);
+        holder->name = "ChestGlowSeam";
+        holder->local.translate.x = (minX + maxX) * 0.5f;
+        holder->local.translate.y = (minY + maxY) * 0.5f;
+        holder->local.translate.z = minZ + (maxZ - minZ) * g_settings.seamHeight;
 
+        // 'stretch' stretches the 1x1 seam model to the chest's width and depth
+        // (heights stay in normal units, so the glow line keeps the same thickness).
+        auto* stretch = RE::NiNode::Create(1);
+        auto* glow = CloneModel(seamTemplate);
+        if (stretch && glow) {
+            constexpr float margin = 0.6f;  // sit just outside the chest's surface
+            stretch->name = "ChestGlowSeamStretch";
+            stretch->local.rotate.entry[0][0] = (maxX - minX) + 2.0f * margin;
+            stretch->local.rotate.entry[1][1] = (maxY - minY) + 2.0f * margin;
+            stretch->local.rotate.entry[2][2] = 1.0f;
+            ColorSeamModel(glow, g_settings.tiers[a_tier].color);
+            stretch->AttachChild(glow, true);
+            holder->AttachChild(stretch, true);
+        }
+
+        root->AttachChild(holder, true);
         RE::NiUpdateData update{};
-        node->Update(update);
+        holder->Update(update);
 
-        auto* light = GenDynamicLight(g_lightForms[a_tier], a_chest, node);
-        node->Update(update);
+        RE::NiAVObject* light = nullptr;
+        if (g_settings.lightSurroundings && g_lightForms[a_tier]) {
+            light = GenDynamicLight(g_lightForms[a_tier], a_chest, holder);
+            holder->Update(update);
+        }
 
         SeamLight entry;
-        entry.node.reset(node);
+        entry.node.reset(holder);
         entry.light.reset(light);
         entry.root = model;
         entry.tier = a_tier;
         g_seamLights[a_chest->GetFormID()] = std::move(entry);
+        return true;
     }
 
     bool IsChest(RE::TESObjectREFR* a_ref)
@@ -738,9 +846,7 @@ namespace
     {
         RemoveGlow(a_chest);
         if (a_tier < TIER_COUNT) {
-            if (g_settings.seamLight) {
-                AddSeamLight(a_chest, a_tier);
-            } else {
+            if (!g_settings.seamLight || !AddSeamLight(a_chest, a_tier)) {
                 PlayShader(a_chest, g_shaders[a_tier], -1.0f);  // -1 = glow until we remove it
             }
             if (g_settings.showConsoleMessages) {
@@ -1187,12 +1293,16 @@ namespace
             }
 
             g_separatorText("Glow style");
-            changed |= g_checkbox("Light from the lid seam (untick: whole chest glows)", &g_settings.seamLight);
+            changed |= g_checkbox("Glowing seam with rays (untick: whole chest glows)", &g_settings.seamLight);
 
-            g_separatorText("Seam light");
-            changed |= g_sliderFloat("Light reach", &g_settings.lightRadius, 30.0f, 1000.0f, "%.0f", 0);
-            changed |= g_sliderFloat("Light brightness", &g_settings.lightBrightness, 0.1f, 10.0f, "%.1f", 0);
+            g_separatorText("Seam glow");
+            changed |= g_sliderFloat("Seam glow brightness", &g_settings.seamGlowStrength, 0.1f, 10.0f, "%.1f", 0);
             changed |= g_sliderFloat("Seam height (0 = bottom, 1 = top)", &g_settings.seamHeight, 0.0f, 1.0f, "%.2f", 0);
+            changed |= g_checkbox("Also light up the floor and walls", &g_settings.lightSurroundings);
+            if (g_settings.lightSurroundings) {
+                changed |= g_sliderFloat("Light reach", &g_settings.lightRadius, 30.0f, 1000.0f, "%.0f", 0);
+                changed |= g_sliderFloat("Light brightness", &g_settings.lightBrightness, 0.1f, 10.0f, "%.1f", 0);
+            }
 
             g_separatorText("Whole-chest glow");
             changed |= g_sliderFloat("Brightness", &g_settings.glowStrength, 0.0f, 1.0f, "%.2f", 0);
@@ -1286,8 +1396,8 @@ namespace
             return;
         }
         if (!CreateLightForms()) {
-            Log("ERROR: could not create the seam lights. Switching to whole-chest glow.");
-            g_settings.seamLight = false;
+            Log("ERROR: could not create the surrounding lights. That option won't work.");
+            g_settings.lightSurroundings = false;
         }
         auto* events = RE::ScriptEventSourceHolder::GetSingleton();
         if (!events) {

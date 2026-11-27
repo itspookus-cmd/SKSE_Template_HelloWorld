@@ -63,6 +63,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path package/SKSE/Plugins | Out-Null
           Copy-Item build/release/*.dll package/SKSE/Plugins/
           if (Test-Path ChestGlow.ini) { Copy-Item ChestGlow.ini package/SKSE/Plugins/ }
+          # Glow models and textures, if they've been added to the repo in an 'assets' folder
+          if (Test-Path assets) { Copy-Item assets/* package/ -Recurse -Force }
 
       - name: Save the finished mod so you can download it
         uses: actions/upload-artifact@v4
