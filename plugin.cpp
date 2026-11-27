@@ -3,8 +3,9 @@
 //
 //  What it does, in plain words:
 //    1. Whenever a chest appears in the world, look inside it.
-//    2. If it holds a "Legendary" weapon, make the chest glow yellow.
-//       Otherwise, if it holds an "Epic" weapon, make it glow purple.
+//    2. Sort each weapon into a tier by its gold value:
+//         Legendary (yellow), Epic (purple) or Common (green).
+//       The chest glows in the color of the best tier inside it.
 //    3. Whenever items move in or out of a chest, look again, so the
 //       glow goes away once you take the weapon.
 //
@@ -47,17 +48,32 @@ namespace
     // ---------------------------------------------------------------
     //  Settings (defaults here; ChestGlow.ini and the menu change them)
     // ---------------------------------------------------------------
+    // One rarity tier: a gold range ("from" and "to", both included) and a color.
+    struct Tier
+    {
+        const char* name;     // shown in the menu and log
+        const char* iniName;  // used for the keys in ChestGlow.ini
+        bool        enabled;
+        int         from;
+        int         to;
+        bool        mustBeEnchanted;
+        RE::Color   color;
+    };
+
+    // Best tier first. If ranges overlap, the better tier wins.
+    constexpr int TIER_COUNT = 3;
+
     struct Settings
     {
         bool enabled = true;
 
-        int  legendaryMinValue = 2000;      // weapons worth this much gold or more are Legendary
+        Tier tiers[TIER_COUNT] = {
+            { "Legendary", "Legendary", true, 1000, 10000, false, RE::Color(255, 200, 0, 255) },  // yellow
+            { "Epic", "Epic", true, 100, 1000, false, RE::Color(170, 60, 255, 255) },             // purple
+            { "Common", "Common", true, 0, 100, false, RE::Color(60, 220, 80, 255) },             // green
+        };
         bool artifactsAreLegendary = true;  // Daedric artifacts always count as Legendary
-        int  epicMinValue = 500;            // enchanted weapons worth this much or more are Epic
-        bool epicMustBeEnchanted = true;
 
-        RE::Color legendaryColor{ 255, 200, 0, 255 };  // yellow
-        RE::Color epicColor{ 170, 60, 255, 255 };      // purple
         float     glowStrength = 1.0f;                  // 0.0 (faint) to 1.0 (strong)
         float     pulseSpeed = 1.0f;                    // how fast the glow breathes; 0 = steady
 
@@ -150,12 +166,15 @@ namespace
         };
 
         g_settings.enabled = getBool("enabled", g_settings.enabled);
-        g_settings.legendaryMinValue = getInt("legendaryminvalue", g_settings.legendaryMinValue);
+        for (auto& tier : g_settings.tiers) {
+            const std::string key = ToLower(tier.iniName);
+            tier.enabled = getBool((key + "enabled").c_str(), tier.enabled);
+            tier.from = std::max(0, getInt((key + "from").c_str(), tier.from));
+            tier.to = std::max(0, getInt((key + "to").c_str(), tier.to));
+            tier.mustBeEnchanted = getBool((key + "mustbeenchanted").c_str(), tier.mustBeEnchanted);
+            tier.color = getColor((key + "color").c_str(), tier.color);
+        }
         g_settings.artifactsAreLegendary = getBool("artifactsarelegendary", g_settings.artifactsAreLegendary);
-        g_settings.epicMinValue = getInt("epicminvalue", g_settings.epicMinValue);
-        g_settings.epicMustBeEnchanted = getBool("epicmustbeenchanted", g_settings.epicMustBeEnchanted);
-        g_settings.legendaryColor = getColor("legendarycolor", g_settings.legendaryColor);
-        g_settings.epicColor = getColor("epiccolor", g_settings.epicColor);
         g_settings.glowStrength = std::clamp(getFloat("glowstrength", g_settings.glowStrength), 0.0f, 1.0f);
         g_settings.pulseSpeed = std::max(0.0f, getFloat("pulsespeed", g_settings.pulseSpeed));
         g_settings.showConsoleMessages = getBool("showconsolemessages", g_settings.showConsoleMessages);
@@ -163,8 +182,12 @@ namespace
             g_settings.glowTexture = it->second;
         }
 
-        Log("Settings loaded. Legendary >= " + std::to_string(g_settings.legendaryMinValue) +
-            " gold, Epic >= " + std::to_string(g_settings.epicMinValue) + " gold.");
+        std::string summary = "Settings loaded.";
+        for (const auto& tier : g_settings.tiers) {
+            summary += std::string(" ") + tier.name + ": " + std::to_string(tier.from) + " to " + std::to_string(tier.to) +
+                       (tier.enabled ? "" : " (off)") + ".";
+        }
+        Log(summary);
     }
 
     bool SaveSettings()
@@ -182,19 +205,23 @@ namespace
              << "[General]\n"
              << "; Turn the whole mod on or off.\n"
              << "Enabled = " << b(g_settings.enabled) << "\n\n"
-             << "[Rarity]\n"
-             << "; A weapon worth this much gold or more counts as LEGENDARY.\n"
-             << "LegendaryMinValue = " << g_settings.legendaryMinValue << "\n"
-             << "; Daedric artifacts always count as Legendary.\n"
-             << "ArtifactsAreLegendary = " << b(g_settings.artifactsAreLegendary) << "\n"
-             << "; A weapon worth this much gold or more counts as EPIC.\n"
-             << "EpicMinValue = " << g_settings.epicMinValue << "\n"
-             << "; If true, an Epic weapon must also be enchanted.\n"
-             << "EpicMustBeEnchanted = " << b(g_settings.epicMustBeEnchanted) << "\n\n"
+             << "; Each tier is a gold range: From and To are both included.\n"
+             << "; If ranges overlap, the better tier wins. A chest glows in the\n"
+             << "; color of the best tier inside it. Colors are Red, Green, Blue (0 to 255).\n"
+             << "; MustBeEnchanted = true means only enchanted weapons can be in that tier.\n\n";
+        for (const auto& tier : g_settings.tiers) {
+            const std::string n = tier.iniName;
+            file << "[" << n << "]\n"
+                 << n << "Enabled = " << b(tier.enabled) << "\n"
+                 << n << "From = " << tier.from << "\n"
+                 << n << "To = " << tier.to << "\n"
+                 << n << "MustBeEnchanted = " << b(tier.mustBeEnchanted) << "\n"
+                 << n << "Color = " << ColorToText(tier.color) << "\n\n";
+        }
+        file << "[Rules]\n"
+             << "; Daedric artifacts always count as Legendary, whatever their value.\n"
+             << "ArtifactsAreLegendary = " << b(g_settings.artifactsAreLegendary) << "\n\n"
              << "[Glow]\n"
-             << "; Colors as Red, Green, Blue (each 0 to 255).\n"
-             << "LegendaryColor = " << ColorToText(g_settings.legendaryColor) << "\n"
-             << "EpicColor = " << ColorToText(g_settings.epicColor) << "\n"
              << "; How bright the glow is, from 0.0 (faint) to 1.0 (strong).\n"
              << "GlowStrength = " << g_settings.glowStrength << "\n"
              << "; How fast the glow gently pulses. 0 = steady glow.\n"
@@ -211,28 +238,36 @@ namespace
     // ---------------------------------------------------------------
     //  Rarity rules
     // ---------------------------------------------------------------
-    enum class Rarity
-    {
-        kNone,
-        kEpic,
-        kLegendary
-    };
+    // A tier is identified by its position in the list: 0 = Legendary (best),
+    // 1 = Epic, 2 = Common. NO_TIER means "doesn't glow".
+    constexpr int NO_TIER = TIER_COUNT;
 
-    const char* RarityName(Rarity a_rarity)
+    const char* TierName(int a_tier)
     {
-        switch (a_rarity) {
-        case Rarity::kLegendary:
-            return "Legendary";
-        case Rarity::kEpic:
-            return "Epic";
-        default:
-            return "None";
+        return a_tier < TIER_COUNT ? g_settings.tiers[a_tier].name : "None (no glow)";
+    }
+
+    // Which tier a single weapon belongs to. Lower number = better.
+    int GetWeaponTier(int a_value, bool a_enchanted, bool a_artifact)
+    {
+        if (a_artifact && g_settings.tiers[0].enabled) {
+            return 0;  // Legendary
         }
+        for (int i = 0; i < TIER_COUNT; ++i) {
+            const auto& tier = g_settings.tiers[i];
+            if (!tier.enabled || (tier.mustBeEnchanted && !a_enchanted)) {
+                continue;
+            }
+            if (a_value >= tier.from && a_value <= tier.to) {
+                return i;  // first match is the best, because the list is best-first
+            }
+        }
+        return NO_TIER;
     }
 
     struct ChestReport
     {
-        Rarity      rarity = Rarity::kNone;
+        int         tier = NO_TIER;
         std::string chestName;
         std::string weaponName;  // the weapon that decided the color
         int         weaponValue = 0;
@@ -269,17 +304,12 @@ namespace
             const bool enchanted = entry->IsEnchanted() || weapon->formEnchanting != nullptr;
             const bool artifact = g_settings.artifactsAreLegendary && weapon->HasKeywordString("DaedricArtifact");
 
-            Rarity rarity = Rarity::kNone;
-            if (artifact || value >= g_settings.legendaryMinValue) {
-                rarity = Rarity::kLegendary;
-            } else if (value >= g_settings.epicMinValue && (enchanted || !g_settings.epicMustBeEnchanted)) {
-                rarity = Rarity::kEpic;
-            }
+            const int tier = GetWeaponTier(value, enchanted, artifact);
 
-            // Keep the best weapon (highest tier, then highest value) as the "reason".
-            const bool better = rarity > report.rarity || (rarity == report.rarity && value > report.weaponValue);
+            // Keep the best weapon (best tier, then highest value) as the "reason".
+            const bool better = tier < report.tier || (tier == report.tier && value > report.weaponValue);
             if (better || report.weaponName.empty()) {
-                report.rarity = std::max(report.rarity, rarity);
+                report.tier = std::min(report.tier, tier);
                 report.weaponName = weapon->GetName() ? weapon->GetName() : "(unnamed)";
                 report.weaponValue = value;
                 report.weaponEnchanted = enchanted;
@@ -292,9 +322,18 @@ namespace
     // ---------------------------------------------------------------
     //  The two glow effects (built in code, no Creation Kit needed)
     // ---------------------------------------------------------------
-    RE::TESEffectShader* g_legendaryShader = nullptr;
-    RE::TESEffectShader* g_epicShader = nullptr;
+    RE::TESEffectShader* g_shaders[TIER_COUNT] = {};  // one glow per tier
     std::string          g_textureInUse;
+
+    bool IsOurShader(const RE::TESEffectShader* a_shader)
+    {
+        return a_shader && std::find(std::begin(g_shaders), std::end(g_shaders), a_shader) != std::end(g_shaders);
+    }
+
+    bool ShadersReady()
+    {
+        return std::all_of(std::begin(g_shaders), std::end(g_shaders), [](auto* s) { return s != nullptr; });
+    }
 
     // Find a vanilla glow effect to borrow textures from, so ours renders properly.
     RE::TESEffectShader* FindTemplateShader()
@@ -440,9 +479,10 @@ namespace
             g_textureInUse = g_settings.glowTexture;
         }
 
-        g_legendaryShader = MakeGlowShader(templ, g_settings.legendaryColor);
-        g_epicShader = MakeGlowShader(templ, g_settings.epicColor);
-        if (!g_legendaryShader || !g_epicShader || g_legendaryShader == g_epicShader) {
+        for (int i = 0; i < TIER_COUNT; ++i) {
+            g_shaders[i] = MakeGlowShader(templ, g_settings.tiers[i].color);
+        }
+        if (!ShadersReady()) {
             Log("ERROR: could not create the glow effects.");
             return false;
         }
@@ -488,7 +528,7 @@ namespace
             } else {
                 effect = &a_effect;
             }
-            if (effect && (effect->effectData == g_legendaryShader || effect->effectData == g_epicShader)) {
+            if (effect && IsOurShader(effect->effectData)) {
                 auto target = effect->target.get();
                 if (target && target.get() == a_chest) {
                     effect->finished = true;
@@ -503,7 +543,7 @@ namespace
 
     void UpdateChest(RE::TESObjectREFR* a_chest)
     {
-        if (!g_legendaryShader || !g_epicShader || !IsChest(a_chest)) {
+        if (!ShadersReady() || !IsChest(a_chest)) {
             return;
         }
 
@@ -521,18 +561,11 @@ namespace
             g_hasReport = true;
         }
 
-        RE::TESEffectShader* shader = nullptr;
-        if (report.rarity == Rarity::kLegendary) {
-            shader = g_legendaryShader;
-        } else if (report.rarity == Rarity::kEpic) {
-            shader = g_epicShader;
-        }
-
-        if (shader) {
-            PlayShader(a_chest, shader, -1.0f);  // -1 = glow until we remove it
+        if (report.tier < TIER_COUNT) {
+            PlayShader(a_chest, g_shaders[report.tier], -1.0f);  // -1 = glow until we remove it
             if (g_settings.showConsoleMessages) {
                 RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest '%s' because of '%s' (%d gold)",
-                    RarityName(report.rarity), report.chestName.c_str(), report.weaponName.c_str(), report.weaponValue);
+                    TierName(report.tier), report.chestName.c_str(), report.weaponName.c_str(), report.weaponValue);
             }
         }
     }
@@ -562,8 +595,9 @@ namespace
         if (auto* tasks = SKSE::GetTaskInterface()) {
             tasks->AddTask([]() {
                 g_refreshQueued = false;
-                ApplyLook(g_legendaryShader, g_settings.legendaryColor);
-                ApplyLook(g_epicShader, g_settings.epicColor);
+                for (int i = 0; i < TIER_COUNT; ++i) {
+                    ApplyLook(g_shaders[i], g_settings.tiers[i].color);
+                }
                 const auto chests = g_loadedChests;  // copy: UpdateChest may change the list
                 for (auto id : chests) {
                     UpdateChest(RE::TESForm::LookupByID<RE::TESObjectREFR>(id));
@@ -649,6 +683,9 @@ namespace
         using Button_t = bool (*)(const char*, Vec2);
         using Checkbox_t = bool (*)(const char*, bool*);
         using SliderInt_t = bool (*)(const char*, int*, int, int, const char*, int);
+        using InputInt_t = bool (*)(const char*, int*, int, int, int);
+        using PushID_t = void (*)(int);
+        using PushItemWidth_t = void (*)(float);
         using SliderFloat_t = bool (*)(const char*, float*, float, float, const char*, int);
         using ColorEdit3_t = bool (*)(const char*, float*, int);
         using Void_t = void (*)();
@@ -661,6 +698,11 @@ namespace
         Button_t        g_button = nullptr;
         Checkbox_t      g_checkbox = nullptr;
         SliderInt_t     g_sliderInt = nullptr;
+        InputInt_t      g_inputInt = nullptr;
+        PushID_t        g_pushID = nullptr;
+        Void_t          g_popID = nullptr;
+        PushItemWidth_t g_pushItemWidth = nullptr;
+        Void_t          g_popItemWidth = nullptr;
         SliderFloat_t   g_sliderFloat = nullptr;
         ColorEdit3_t    g_colorEdit3 = nullptr;
         Void_t          g_spacing = nullptr;
@@ -706,21 +748,35 @@ namespace
             changed |= g_checkbox("Mod enabled", &g_settings.enabled);
             g_checkbox("Print a console line when a chest glows", &g_settings.showConsoleMessages);
 
-            g_separatorText("What counts as Legendary (yellow)");
-            changed |= g_sliderInt("Legendary: minimum gold value", &g_settings.legendaryMinValue, 100, 20000, "%d", 0);
-            changed |= g_checkbox("Daedric artifacts are always Legendary", &g_settings.artifactsAreLegendary);
+            Text("Each tier is a gold range. 'From' and 'To' are both included. "
+                 "If ranges overlap, the better tier wins.");
+            for (int i = 0; i < TIER_COUNT; ++i) {
+                auto& tier = g_settings.tiers[i];
+                g_pushID(i);  // lets each tier reuse the same labels
 
-            g_separatorText("What counts as Epic (purple)");
-            changed |= g_sliderInt("Epic: minimum gold value", &g_settings.epicMinValue, 50, 10000, "%d", 0);
-            changed |= g_checkbox("Epic weapons must be enchanted", &g_settings.epicMustBeEnchanted);
-            if (g_settings.epicMinValue >= g_settings.legendaryMinValue) {
-                TextColored({ 1.0f, 0.6f, 0.2f, 1.0f },
-                    "Note: Epic's minimum is not lower than Legendary's, so nothing can be Epic.");
+                const std::string title = std::string(tier.name) + " tier";
+                g_separatorText(title.c_str());
+                changed |= g_checkbox("Enabled", &tier.enabled);
+                g_pushItemWidth(160.0f);
+                changed |= g_inputInt("From (gold)", &tier.from, 10, 100, 0);
+                g_sameLine(0.0f, 20.0f);
+                changed |= g_inputInt("To (gold)", &tier.to, 10, 100, 0);
+                g_popItemWidth();
+                tier.from = std::max(0, tier.from);
+                tier.to = std::max(0, tier.to);
+                changed |= ColorPicker("Color", tier.color);
+                changed |= g_checkbox("Only enchanted weapons", &tier.mustBeEnchanted);
+                if (i == 0) {
+                    changed |= g_checkbox("Daedric artifacts are always Legendary", &g_settings.artifactsAreLegendary);
+                }
+                if (tier.from > tier.to) {
+                    TextColored({ 1.0f, 0.6f, 0.2f, 1.0f }, "'From' is bigger than 'To', so nothing can be in this tier.");
+                }
+
+                g_popID();
             }
 
             g_separatorText("Glow look");
-            changed |= ColorPicker("Legendary color", g_settings.legendaryColor);
-            changed |= ColorPicker("Epic color", g_settings.epicColor);
             changed |= g_sliderFloat("Brightness", &g_settings.glowStrength, 0.0f, 1.0f, "%.2f", 0);
             changed |= g_sliderFloat("Pulse speed (0 = steady)", &g_settings.pulseSpeed, 0.0f, 5.0f, "%.1f", 0);
             Text("Texture in use: %s", g_textureInUse.c_str());
@@ -754,11 +810,13 @@ namespace
             if (!has) {
                 Text("No chest with weapons checked yet. Walk near one, or add a weapon to one.");
             } else {
-                const Vec4 color = report.rarity == Rarity::kLegendary ? Vec4{ 1.0f, 0.8f, 0.0f, 1.0f } :
-                                   report.rarity == Rarity::kEpic      ? Vec4{ 0.7f, 0.3f, 1.0f, 1.0f } :
-                                                                         Vec4{ 0.7f, 0.7f, 0.7f, 1.0f };
+                Vec4 color{ 0.7f, 0.7f, 0.7f, 1.0f };
+                if (report.tier < TIER_COUNT) {
+                    const auto& c = g_settings.tiers[report.tier].color;
+                    color = { c.red / 255.0f, c.green / 255.0f, c.blue / 255.0f, 1.0f };
+                }
                 Text("Chest: %s", report.chestName.c_str());
-                TextColored(color, "Result: %s", RarityName(report.rarity));
+                TextColored(color, "Result: %s", TierName(report.tier));
                 Text("Best weapon inside: %s", report.weaponName.c_str());
                 Text("Its value: %d gold  |  Enchanted: %s  |  Daedric artifact: %s", report.weaponValue,
                     report.weaponEnchanted ? "yes" : "no", report.weaponIsArtifact ? "yes" : "no");
@@ -779,6 +837,11 @@ namespace
             g_button = Find<Button_t>("igButton");
             g_checkbox = Find<Checkbox_t>("igCheckbox");
             g_sliderInt = Find<SliderInt_t>("igSliderInt");
+            g_inputInt = Find<InputInt_t>("igInputInt");
+            g_pushID = Find<PushID_t>("igPushID_Int");
+            g_popID = Find<Void_t>("igPopID");
+            g_pushItemWidth = Find<PushItemWidth_t>("igPushItemWidth");
+            g_popItemWidth = Find<Void_t>("igPopItemWidth");
             g_sliderFloat = Find<SliderFloat_t>("igSliderFloat");
             g_colorEdit3 = Find<ColorEdit3_t>("igColorEdit3");
             g_spacing = Find<Void_t>("igSpacing");
@@ -786,7 +849,8 @@ namespace
             g_sameLine = Find<SameLine_t>("igSameLine");
             auto addSectionItem = Find<AddSectionItem_t>("AddSectionItem");
 
-            if (!g_textWrappedV || !g_textColoredV || !g_button || !g_checkbox || !g_sliderInt || !g_sliderFloat ||
+            if (!g_textWrappedV || !g_textColoredV || !g_button || !g_checkbox || !g_sliderInt || !g_inputInt ||
+                !g_pushID || !g_popID || !g_pushItemWidth || !g_popItemWidth || !g_sliderFloat ||
                 !g_colorEdit3 || !g_spacing || !g_separatorText || !g_sameLine || !addSectionItem) {
                 Log("ERROR: this version of SKSE Menu Framework is missing something we need, so there is no in-game menu.");
                 return;
