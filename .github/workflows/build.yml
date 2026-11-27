@@ -20,6 +20,9 @@ jobs:
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
       # Where the pre-built libraries are kept between builds (see the cache step)
       VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
+      # A fixed vcpkg version. GitHub's machines each come with their own vcpkg, and a
+      # different vcpkg makes the saved libraries unusable, so we bring our own.
+      VCPKG_VERSION: "2026.10.16"
     steps:
       - name: Get your code
         uses: actions/checkout@v4
@@ -29,14 +32,21 @@ jobs:
         run: New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
 
       # Reuses the libraries built last time instead of building them again.
-      # The first build after this change is still slow; later ones are much faster.
+      # A fresh copy is saved after every build, so one slow build fixes the next ones.
       - name: Restore the library cache
         uses: actions/cache@v4
         with:
           path: vcpkg-cache
-          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          key: vcpkg-${{ env.VCPKG_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-${{ github.run_id }}
           restore-keys: |
-            vcpkg-${{ runner.os }}-
+            vcpkg-${{ env.VCPKG_VERSION }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}-
+            vcpkg-${{ env.VCPKG_VERSION }}-
+
+      - name: Get our fixed vcpkg version
+        shell: pwsh
+        run: |
+          git clone --quiet --depth 1 --branch $env:VCPKG_VERSION https://github.com/microsoft/vcpkg.git "$env:GITHUB_WORKSPACE\..\vcpkg"
+          & "$env:GITHUB_WORKSPACE\..\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
 
       - name: Install the Ninja build tool
         shell: pwsh
@@ -46,10 +56,10 @@ jobs:
         uses: ilammy/msvc-dev-cmd@v1
 
       # This must come AFTER the compiler step, which otherwise overwrites it
-      - name: Point the build at the vcpkg that GitHub already installed
+      - name: Point the build at our vcpkg
         shell: pwsh
         run: |
-          "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "VCPKG_ROOT=$((Resolve-Path "$env:GITHUB_WORKSPACE\..\vcpkg").Path)" | Out-File -FilePath $env:GITHUB_ENV -Append
 
       - name: Configure
         run: cmake --preset release
