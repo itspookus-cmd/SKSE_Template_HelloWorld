@@ -5,6 +5,12 @@ on:
   push:
   workflow_dispatch:
 
+# If you commit again while a build is running, cancel the old build
+# and only build the newest version.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     # Older Windows image with Visual Studio 2022, which matches this template
@@ -12,9 +18,25 @@ jobs:
     env:
       # Lets older libraries build even if the machine has a very new CMake
       CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+      # Where the pre-built libraries are kept between builds (see the cache step)
+      VCPKG_DEFAULT_BINARY_CACHE: ${{ github.workspace }}\vcpkg-cache
     steps:
       - name: Get your code
         uses: actions/checkout@v4
+
+      - name: Make the library cache folder
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path "$env:VCPKG_DEFAULT_BINARY_CACHE" | Out-Null
+
+      # Reuses the libraries built last time instead of building them again.
+      # The first build after this change is still slow; later ones are much faster.
+      - name: Restore the library cache
+        uses: actions/cache@v4
+        with:
+          path: vcpkg-cache
+          key: vcpkg-${{ runner.os }}-${{ hashFiles('vcpkg.json', 'vcpkg-configuration.json') }}
+          restore-keys: |
+            vcpkg-${{ runner.os }}-
 
       - name: Install the Ninja build tool
         shell: pwsh
