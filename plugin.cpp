@@ -621,8 +621,7 @@ namespace
         }
         if (!a_chest->Is3DLoaded()) {
             RemoveGlow(a_chest);
-            DebugLog(std::string("[") + a_source + "] " + Describe(a_chest) + ": not visible yet, skipped");
-            return;
+            return;  // not visible yet; the nearby scan will catch it once it is
         }
 
         const ChestReport report = CheckChest(a_chest);
@@ -680,33 +679,53 @@ namespace
         return result;
     }
 
+    // Containers in the loaded area around you. Filled from the game's "area loaded"
+    // signal (see CellAttachListener below). Main thread only.
+    std::unordered_set<RE::FormID> g_nearbyContainers;
+
+    // Scanning only runs once a save is fully loaded, and pauses during loading screens.
+    std::atomic<bool> g_inWorld{ false };
+    std::atomic<int>  g_scansToSkip{ 0 };     // wait a few seconds after loading before scanning
+    std::atomic<bool> g_logNextScan{ false };  // log the first scan after each load step by step
+
     // a_force = re-apply every glow (used after changing colors in the menu).
     void ScanNearby(bool a_force)
     {
-        if (!ShadersReady()) {
+        if (!ShadersReady() || !g_inWorld) {
             return;
         }
+        if (auto* ui = RE::UI::GetSingleton(); !ui || ui->IsMenuOpen(RE::LoadingMenu::MENU_NAME)) {
+            return;  // loading screen
+        }
         auto* player = RE::PlayerCharacter::GetSingleton();
-        auto* tes = RE::TES::GetSingleton();
-        if (!player || !tes || !player->GetParentCell() || !player->Is3DLoaded()) {
-            return;  // main menu or loading screen
+        if (!player || !player->GetParentCell()) {
+            return;
         }
 
-        // First just collect the containers nearby (don't change anything while the game is listing them).
-        std::vector<RE::FormID> nearby;
-        tes->ForEachReferenceInRange(player, g_settings.scanRadius, [&](RE::TESObjectREFR& a_ref) {
-            auto* base = a_ref.GetBaseObject();
-            if (base && base->Is(RE::FormType::Container)) {
-                nearby.push_back(a_ref.GetFormID());
+        const bool logSteps = g_settings.detailedLog && g_logNextScan.exchange(false);
+
+        // Which known containers are close enough and visible.
+        const auto  playerPos = player->GetPosition();
+        const float maxDistSq = g_settings.scanRadius * g_settings.scanRadius;
+        std::vector<RE::TESObjectREFR*> nearby;
+        for (auto id : g_nearbyContainers) {
+            auto* ref = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+            if (!ref || playerPos.GetSquaredDistance(ref->GetPosition()) > maxDistSq) {
+                continue;
             }
-            return RE::BSContainer::ForEachResult::kContinue;
-        });
+            if (IsChest(ref) && ref->Is3DLoaded()) {
+                nearby.push_back(ref);
+            }
+        }
+        if (logSteps) {
+            Log("First scan after loading: " + std::to_string(g_nearbyContainers.size()) + " container(s) in the loaded area, " +
+                std::to_string(nearby.size()) + " close enough to check.");
+        }
 
         const auto current = FindCurrentGlows();
-        for (auto id : nearby) {
-            auto* chest = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
-            if (!IsChest(chest) || !chest->Is3DLoaded()) {
-                continue;
+        for (auto* chest : nearby) {
+            if (logSteps) {
+                Log("  checking " + Describe(chest));
             }
             const ChestReport report = CheckChest(chest);
             const int         want = DesiredTier(report);
@@ -721,6 +740,9 @@ namespace
                 RememberReport(report);
                 SetGlow(chest, want, report);
             }
+        }
+        if (logSteps) {
+            Log("First scan finished.");
         }
     }
 
@@ -750,6 +772,13 @@ namespace
             for (;;) {
                 const auto ms = static_cast<int>(g_settings.scanInterval * 1000.0f);
                 std::this_thread::sleep_for(std::chrono::milliseconds(std::max(500, ms)));
+                if (!g_inWorld) {
+                    continue;
+                }
+                if (g_scansToSkip > 0) {
+                    --g_scansToSkip;
+                    continue;
+                }
                 QueueScan(false);
             }
         }).detach();
@@ -805,6 +834,37 @@ namespace
         }
     };
 
+    // Fires for each object when the area around it loads or unloads.
+    // We use it to keep a list of the containers around you.
+    class CellAttachListener : public RE::BSTEventSink<RE::TESCellAttachDetachEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESCellAttachDetachEvent* a_event,
+            RE::BSTEventSource<RE::TESCellAttachDetachEvent>*) override
+        {
+            if (!a_event || !a_event->reference) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            RE::TESObjectREFR* ref = &*a_event->reference;
+            auto*              base = ref->GetBaseObject();
+            if (!base || !base->Is(RE::FormType::Container)) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            const auto id = ref->GetFormID();
+            const bool attached = a_event->attached != 0;
+            if (auto* tasks = SKSE::GetTaskInterface()) {
+                tasks->AddTask([id, attached]() {
+                    if (attached) {
+                        g_nearbyContainers.insert(id);
+                    } else {
+                        g_nearbyContainers.erase(id);
+                    }
+                });
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
     // Fires when something is activated, e.g. you open a chest.
     class ActivateListener : public RE::BSTEventSink<RE::TESActivateEvent>
     {
@@ -822,6 +882,7 @@ namespace
     ObjectLoadedListener     g_objectLoadedListener;
     ContainerChangedListener g_containerChangedListener;
     ActivateListener         g_activateListener;
+    CellAttachListener       g_cellAttachListener;
 
     // ---------------------------------------------------------------
     //  In-game settings page (only if SKSE Menu Framework is installed)
@@ -1048,6 +1109,7 @@ namespace
         events->AddEventSink<RE::TESObjectLoadedEvent>(&g_objectLoadedListener);
         events->AddEventSink<RE::TESContainerChangedEvent>(&g_containerChangedListener);
         events->AddEventSink<RE::TESActivateEvent>(&g_activateListener);
+        events->AddEventSink<RE::TESCellAttachDetachEvent>(&g_cellAttachListener);
         StartScanner();
         Log("Chest Glow is running.");
 
@@ -1060,8 +1122,21 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse)
     SKSE::Init(skse);
 
     SKSE::GetMessagingInterface()->RegisterListener([](SKSE::MessagingInterface::Message* message) {
-        if (message->type == SKSE::MessagingInterface::kDataLoaded) {
+        switch (message->type) {
+        case SKSE::MessagingInterface::kDataLoaded:
             OnDataLoaded();
+            break;
+        case SKSE::MessagingInterface::kPreLoadGame:
+            g_inWorld = false;  // pause scanning while a save loads
+            break;
+        case SKSE::MessagingInterface::kPostLoadGame:
+        case SKSE::MessagingInterface::kNewGame:
+            g_scansToSkip = 2;  // give the game a few seconds to settle
+            g_logNextScan = true;
+            g_inWorld = true;
+            break;
+        default:
+            break;
         }
     });
 
