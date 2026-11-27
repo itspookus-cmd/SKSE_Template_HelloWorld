@@ -15,6 +15,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cctype>
 #include <cstdarg>
 #include <fstream>
@@ -23,9 +25,11 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace
 {
@@ -78,6 +82,10 @@ namespace
         float     pulseSpeed = 1.0f;                    // how fast the glow breathes; 0 = steady
 
         bool showConsoleMessages = false;  // print to the ~ console when a chest glows
+        bool detailedLog = false;          // write every chest check to ChestGlow.log
+
+        float scanRadius = 3000.0f;  // how far around you to look for containers (game units)
+        float scanInterval = 2.0f;   // seconds between looks
 
         std::string glowTexture;  // optional: a texture path to use instead of the automatic pick
     };
@@ -178,6 +186,9 @@ namespace
         g_settings.glowStrength = std::clamp(getFloat("glowstrength", g_settings.glowStrength), 0.0f, 1.0f);
         g_settings.pulseSpeed = std::max(0.0f, getFloat("pulsespeed", g_settings.pulseSpeed));
         g_settings.showConsoleMessages = getBool("showconsolemessages", g_settings.showConsoleMessages);
+        g_settings.detailedLog = getBool("detailedlog", g_settings.detailedLog);
+        g_settings.scanRadius = std::clamp(getFloat("scanradius", g_settings.scanRadius), 500.0f, 10000.0f);
+        g_settings.scanInterval = std::clamp(getFloat("scaninterval", g_settings.scanInterval), 0.5f, 10.0f);
         if (auto it = values.find("glowtexture"); it != values.end()) {
             g_settings.glowTexture = it->second;
         }
@@ -230,7 +241,14 @@ namespace
              << "GlowTexture = " << g_settings.glowTexture << "\n\n"
              << "[Debug]\n"
              << "; If true, the ~ console prints a line each time a chest starts glowing.\n"
-             << "ShowConsoleMessages = " << b(g_settings.showConsoleMessages) << "\n";
+             << "ShowConsoleMessages = " << b(g_settings.showConsoleMessages) << "\n"
+             << "; If true, ChestGlow.log records every chest check (for troubleshooting).\n"
+             << "DetailedLog = " << b(g_settings.detailedLog) << "\n\n"
+             << "[Performance]\n"
+             << "; How far around you the mod looks for containers (Skyrim units; about 70 = 1 meter).\n"
+             << "ScanRadius = " << g_settings.scanRadius << "\n"
+             << "; Seconds between looks.\n"
+             << "ScanInterval = " << g_settings.scanInterval << "\n";
         Log("Settings saved to ChestGlow.ini.");
         return true;
     }
@@ -538,73 +556,216 @@ namespace
         });
     }
 
-    // Chests currently loaded in the world, so the menu can refresh them all.
-    std::unordered_set<RE::FormID> g_loadedChests;  // only touched on the main thread
-
-    void UpdateChest(RE::TESObjectREFR* a_chest)
+    void DebugLog(const std::string& a_text)
     {
-        if (!ShadersReady() || !IsChest(a_chest)) {
-            return;
+        if (g_settings.detailedLog) {
+            Log(a_text);
         }
+    }
 
+    std::string Describe(RE::TESObjectREFR* a_chest)
+    {
+        char id[16];
+        std::snprintf(id, sizeof(id), "%08X", a_chest->GetFormID());
+        const char* name = a_chest->GetName();
+        return std::string("'") + (name && *name ? name : "(no name)") + "' [" + id + "]";
+    }
+
+    // Which glow tier a chest should have right now (NO_TIER = none).
+    int DesiredTier(const ChestReport& a_report)
+    {
+        return g_settings.enabled ? a_report.tier : NO_TIER;
+    }
+
+    // Puts the right glow on a chest (or none).
+    void SetGlow(RE::TESObjectREFR* a_chest, int a_tier, const ChestReport& a_report)
+    {
         RemoveGlow(a_chest);
-
-        if (!g_settings.enabled || !a_chest->Is3DLoaded()) {
-            return;  // switched off, or not visible yet (we'll check again when it loads)
-        }
-        g_loadedChests.insert(a_chest->GetFormID());
-
-        const ChestReport report = CheckChest(a_chest);
-        if (report.weaponsFound > 0) {
-            std::scoped_lock guard(g_reportLock);
-            g_lastReport = report;
-            g_hasReport = true;
-        }
-
-        if (report.tier < TIER_COUNT) {
-            PlayShader(a_chest, g_shaders[report.tier], -1.0f);  // -1 = glow until we remove it
+        if (a_tier < TIER_COUNT) {
+            PlayShader(a_chest, g_shaders[a_tier], -1.0f);  // -1 = glow until we remove it
             if (g_settings.showConsoleMessages) {
                 RE::ConsoleLog::GetSingleton()->Print("[ChestGlow] %s chest '%s' because of '%s' (%d gold)",
-                    TierName(report.tier), report.chestName.c_str(), report.weaponName.c_str(), report.weaponValue);
+                    TierName(a_tier), a_report.chestName.c_str(), a_report.weaponName.c_str(), a_report.weaponValue);
             }
         }
     }
 
+    void RememberReport(const ChestReport& a_report)
+    {
+        if (a_report.weaponsFound > 0) {
+            std::scoped_lock guard(g_reportLock);
+            g_lastReport = a_report;
+            g_hasReport = true;
+        }
+    }
+
+    void LogCheck(RE::TESObjectREFR* a_chest, const ChestReport& a_report, const char* a_source)
+    {
+        if (!g_settings.detailedLog) {
+            return;
+        }
+        std::string line = std::string("[") + a_source + "] " + Describe(a_chest) + ": " +
+                           std::to_string(a_report.weaponsFound) + " weapon(s)";
+        if (a_report.weaponsFound > 0) {
+            line += ", best '" + a_report.weaponName + "' (" + std::to_string(a_report.weaponValue) + " gold)";
+        }
+        line += std::string(" -> ") + TierName(DesiredTier(a_report));
+        Log(line);
+    }
+
+    // Checks one chest right now and sets its glow. Main thread only.
+    void UpdateChest(RE::TESObjectREFR* a_chest, const char* a_source)
+    {
+        if (!ShadersReady() || !IsChest(a_chest)) {
+            return;
+        }
+        if (!a_chest->Is3DLoaded()) {
+            RemoveGlow(a_chest);
+            DebugLog(std::string("[") + a_source + "] " + Describe(a_chest) + ": not visible yet, skipped");
+            return;
+        }
+
+        const ChestReport report = CheckChest(a_chest);
+        LogCheck(a_chest, report, a_source);
+        RememberReport(report);
+        SetGlow(a_chest, DesiredTier(report), report);
+    }
+
     // Run the check a moment later, on the game's main thread (the safe way).
-    void QueueUpdate(RE::FormID a_chestID)
+    void QueueUpdate(RE::FormID a_chestID, const char* a_source)
     {
         if (a_chestID == 0) {
             return;
         }
         if (auto* tasks = SKSE::GetTaskInterface()) {
-            tasks->AddTask([a_chestID]() {
-                UpdateChest(RE::TESForm::LookupByID<RE::TESObjectREFR>(a_chestID));
+            tasks->AddTask([a_chestID, a_source]() {
+                UpdateChest(RE::TESForm::LookupByID<RE::TESObjectREFR>(a_chestID), a_source);
             });
         }
     }
 
-    // Re-applies the colors/brightness and re-checks every loaded chest.
-    // Used by the menu; the work itself happens on the main thread.
-    std::atomic<bool> g_refreshQueued{ false };
+    // ---------------------------------------------------------------
+    //  The nearby scan: every few seconds, look at the containers around
+    //  you and fix any glow that is missing or wrong. This is the safety net
+    //  for chests the game doesn't tell us about.
+    // ---------------------------------------------------------------
 
-    void QueueRefreshAll()
+    // Which of our glows each object has right now, read from the game's list of active effects.
+    std::unordered_map<RE::TESObjectREFR*, int> FindCurrentGlows()
     {
-        if (g_refreshQueued.exchange(true)) {
+        std::unordered_map<RE::TESObjectREFR*, int> result;
+        auto*                                       processLists = RE::ProcessLists::GetSingleton();
+        if (!processLists) {
+            return result;
+        }
+        processLists->ForEachShaderEffect([&](auto&& a_effect) {
+            RE::ShaderReferenceEffect* effect = nullptr;
+            if constexpr (std::is_pointer_v<std::remove_cvref_t<decltype(a_effect)>>) {
+                effect = a_effect;
+            } else {
+                effect = &a_effect;
+            }
+            if (effect && !effect->finished) {
+                for (int i = 0; i < TIER_COUNT; ++i) {
+                    if (effect->effectData == g_shaders[i]) {
+                        if (auto target = effect->target.get()) {
+                            result[target.get()] = i;
+                        }
+                        break;
+                    }
+                }
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+        return result;
+    }
+
+    // a_force = re-apply every glow (used after changing colors in the menu).
+    void ScanNearby(bool a_force)
+    {
+        if (!ShadersReady()) {
+            return;
+        }
+        auto* player = RE::PlayerCharacter::GetSingleton();
+        auto* tes = RE::TES::GetSingleton();
+        if (!player || !tes || !player->GetParentCell() || !player->Is3DLoaded()) {
+            return;  // main menu or loading screen
+        }
+
+        // First just collect the containers nearby (don't change anything while the game is listing them).
+        std::vector<RE::FormID> nearby;
+        tes->ForEachReferenceInRange(player, g_settings.scanRadius, [&](RE::TESObjectREFR& a_ref) {
+            auto* base = a_ref.GetBaseObject();
+            if (base && base->Is(RE::FormType::Container)) {
+                nearby.push_back(a_ref.GetFormID());
+            }
+            return RE::BSContainer::ForEachResult::kContinue;
+        });
+
+        const auto current = FindCurrentGlows();
+        for (auto id : nearby) {
+            auto* chest = RE::TESForm::LookupByID<RE::TESObjectREFR>(id);
+            if (!IsChest(chest) || !chest->Is3DLoaded()) {
+                continue;
+            }
+            const ChestReport report = CheckChest(chest);
+            const int         want = DesiredTier(report);
+            const auto        it = current.find(chest);
+            const int         have = it != current.end() ? it->second : NO_TIER;
+
+            if (a_force || want != have) {
+                if (!a_force) {
+                    // The scan had to fix this one, so the game's own signal missed it.
+                    LogCheck(chest, report, "scan fix");
+                }
+                RememberReport(report);
+                SetGlow(chest, want, report);
+            }
+        }
+    }
+
+    std::atomic<bool> g_scanQueued{ false };
+
+    void QueueScan(bool a_force)
+    {
+        if (!a_force && g_scanQueued.exchange(true)) {
             return;  // one is already waiting
         }
         if (auto* tasks = SKSE::GetTaskInterface()) {
+            tasks->AddTask([a_force]() {
+                if (!a_force) {
+                    g_scanQueued = false;
+                }
+                ScanNearby(a_force);
+            });
+        } else if (!a_force) {
+            g_scanQueued = false;
+        }
+    }
+
+    // A small background timer that asks for a scan every few seconds.
+    void StartScanner()
+    {
+        std::thread([]() {
+            for (;;) {
+                const auto ms = static_cast<int>(g_settings.scanInterval * 1000.0f);
+                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(500, ms)));
+                QueueScan(false);
+            }
+        }).detach();
+        Log("Nearby scan started.");
+    }
+
+    // Re-applies the colors/brightness and re-checks every nearby chest. Used by the menu.
+    void QueueRefreshAll()
+    {
+        if (auto* tasks = SKSE::GetTaskInterface()) {
             tasks->AddTask([]() {
-                g_refreshQueued = false;
                 for (int i = 0; i < TIER_COUNT; ++i) {
                     ApplyLook(g_shaders[i], g_settings.tiers[i].color);
                 }
-                const auto chests = g_loadedChests;  // copy: UpdateChest may change the list
-                for (auto id : chests) {
-                    UpdateChest(RE::TESForm::LookupByID<RE::TESObjectREFR>(id));
-                }
+                ScanNearby(true);
             });
-        } else {
-            g_refreshQueued = false;
         }
     }
 
@@ -623,12 +784,7 @@ namespace
                 return RE::BSEventNotifyControl::kContinue;
             }
             if (a_event->loaded) {
-                QueueUpdate(a_event->formID);
-            } else {
-                const auto id = a_event->formID;
-                if (auto* tasks = SKSE::GetTaskInterface()) {
-                    tasks->AddTask([id]() { g_loadedChests.erase(id); });
-                }
+                QueueUpdate(a_event->formID, "came into view");
             }
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -642,8 +798,22 @@ namespace
             RE::BSTEventSource<RE::TESContainerChangedEvent>*) override
         {
             if (a_event) {
-                QueueUpdate(a_event->oldContainer);
-                QueueUpdate(a_event->newContainer);
+                QueueUpdate(a_event->oldContainer, "items moved");
+                QueueUpdate(a_event->newContainer, "items moved");
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+
+    // Fires when something is activated, e.g. you open a chest.
+    class ActivateListener : public RE::BSTEventSink<RE::TESActivateEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const RE::TESActivateEvent* a_event,
+            RE::BSTEventSource<RE::TESActivateEvent>*) override
+        {
+            if (a_event && a_event->objectActivated) {
+                QueueUpdate(a_event->objectActivated->GetFormID(), "opened");
             }
             return RE::BSEventNotifyControl::kContinue;
         }
@@ -651,6 +821,7 @@ namespace
 
     ObjectLoadedListener     g_objectLoadedListener;
     ContainerChangedListener g_containerChangedListener;
+    ActivateListener         g_activateListener;
 
     // ---------------------------------------------------------------
     //  In-game settings page (only if SKSE Menu Framework is installed)
@@ -747,6 +918,8 @@ namespace
             g_separatorText("General");
             changed |= g_checkbox("Mod enabled", &g_settings.enabled);
             g_checkbox("Print a console line when a chest glows", &g_settings.showConsoleMessages);
+            g_checkbox("Detailed log (for troubleshooting)", &g_settings.detailedLog);
+            g_sliderFloat("Scan distance", &g_settings.scanRadius, 500.0f, 10000.0f, "%.0f", 0);
 
             Text("Each tier is a gold range. 'From' and 'To' are both included. "
                  "If ranges overlap, the better tier wins.");
@@ -874,6 +1047,8 @@ namespace
         }
         events->AddEventSink<RE::TESObjectLoadedEvent>(&g_objectLoadedListener);
         events->AddEventSink<RE::TESContainerChangedEvent>(&g_containerChangedListener);
+        events->AddEventSink<RE::TESActivateEvent>(&g_activateListener);
+        StartScanner();
         Log("Chest Glow is running.");
 
         Menu::Register();
