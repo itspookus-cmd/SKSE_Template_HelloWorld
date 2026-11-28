@@ -725,8 +725,15 @@ namespace
         "ChestGlow\\SeamRayEpic.nif",
         "ChestGlow\\SeamRayCommon.nif",
     };
+    const char* RING_MODELS[TIER_COUNT] = {
+        "ChestGlow\\SeamRingLegendary.nif",
+        "ChestGlow\\SeamRingEpic.nif",
+        "ChestGlow\\SeamRingCommon.nif",
+    };
     RE::NiPointer<RE::NiNode> g_seamTemplates[TIER_COUNT];
     RE::NiPointer<RE::NiNode> g_rayTemplates[TIER_COUNT];
+    RE::NiPointer<RE::NiNode> g_ringTemplates[TIER_COUNT];
+    bool                      g_ringModelMissing = false;
     bool                      g_seamModelMissing = false;
     bool                      g_rayModelMissing = false;
 
@@ -778,6 +785,22 @@ namespace
             Log(std::string("Loaded seam model ") + SEAM_MODELS[a_tier]);
         }
         return g_seamTemplates[a_tier].get();
+    }
+
+    RE::NiNode* GetRingTemplate(int a_tier)
+    {
+        if (!g_ringTemplates[a_tier] && !g_ringModelMissing) {
+            auto* model = LoadModel(RING_MODELS[a_tier]);
+            if (!model) {
+                g_ringModelMissing = true;
+                Log(std::string("ERROR: could not load meshes\\") + RING_MODELS[a_tier] + ". Round containers will use the box glow.");
+                return nullptr;
+            }
+            g_ringTemplates[a_tier].reset(model);
+            model->DecRefCount();
+            Log(std::string("Loaded ring model ") + RING_MODELS[a_tier]);
+        }
+        return g_ringTemplates[a_tier].get();
     }
 
     RE::NiNode* GetRayTemplate(int a_tier)
@@ -994,6 +1017,30 @@ namespace
         g_lookedAt = info;
     }
 
+    // Barrels, urns, sacks and the like get a round glow instead of a box.
+    bool IsRoundContainer(RE::TESObjectREFR* a_chest, float a_width, float a_depth)
+    {
+        const std::string model = GetModelPath(a_chest);
+        auto has = [&](std::initializer_list<const char*> a_words) {
+            for (auto* word : a_words) {
+                if (model.find(word) != std::string::npos) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        if (has({ "barrel", "urn", "sack", "basket", "keg", "pot", "jar", "bucket", "beehive", "cauldron", "vase" })) {
+            return true;
+        }
+        if (has({ "chest", "table", "dresser", "wardrobe", "cupboard", "safe", "crate", "box", "cabinet", "drawer",
+                "desk", "shelf", "satchel", "knapsack", "coffin", "sarcophag" })) {
+            return false;
+        }
+        // Unknown model: a nearly square footprint is probably round.
+        const float small = std::min(a_width, a_depth), large = std::max(a_width, a_depth);
+        return large > 0.0f && small / large > 0.9f;
+    }
+
     // Adds the seam glow (and, if turned on, a real light) to a chest. Returns false if
     // the seam model isn't available, so the caller can fall back to the whole-chest glow.
     bool AddSeamLight(RE::TESObjectREFR* a_chest, int a_tier)
@@ -1001,8 +1048,7 @@ namespace
         auto* model = a_chest->Get3D();
         auto* root = model ? model->AsNode() : nullptr;
         auto* base = a_chest->GetBaseObject();
-        auto* seamTemplate = GetSeamTemplate(a_tier);
-        if (!root || !base || !seamTemplate) {
+        if (!root || !base) {
             return false;
         }
 
@@ -1013,6 +1059,13 @@ namespace
         float minZ = bounds.boundMin.z, maxZ = bounds.boundMax.z;
         if (maxX <= minX || maxY <= minY || maxZ <= minZ) {
             minX = -30.0f, maxX = 30.0f, minY = -16.0f, maxY = 16.0f, minZ = 0.0f, maxZ = 34.0f;  // unknown: a normal chest
+        }
+
+        // Round containers (barrels...) get the round band; everything else the box band.
+        const bool  round = IsRoundContainer(a_chest, maxX - minX, maxY - minY) && GetRingTemplate(a_tier);
+        auto* seamTemplate = round ? GetRingTemplate(a_tier) : GetSeamTemplate(a_tier);
+        if (!seamTemplate) {
+            return false;
         }
 
         // 'holder' sits at the seam. The light (if any) goes here.
@@ -1042,53 +1095,77 @@ namespace
             holder->AttachChild(stretch, true);
         }
 
-        // Light rays: separate copies placed along each side, so each can move on its own.
+        // Light rays: separate copies placed around the glow, so each can move on its own.
         if (auto* rayTemplate = GetRayTemplate(a_tier)) {
             constexpr float pi = 3.14159265f;
             const float     halfX = (maxX - minX) * 0.5f + margin + 0.3f;
             const float     halfY = (maxY - minY) * 0.5f + margin + 0.3f;
             const float     seed = static_cast<float>(a_chest->GetFormID() % 997);
-            struct Side
+
+            struct Spot
             {
-                float halfLength;  // half the side's length
-                float yaw;         // turns the ray to face outward from this side
+                float x, y;  // where the ray stands (relative to the seam's center)
+                float yaw;   // turns the ray to face outward
+                float lean;  // fan-out toward the ends of a side
             };
-            const Side sides[4] = { { halfX, 0.0f }, { halfX, pi }, { halfY, pi * 0.5f }, { halfY, -pi * 0.5f } };
+            std::vector<Spot> spots;
 
-            for (int side = 0; side < 4; ++side) {
-                const float half = sides[side].halfLength;
-                const int   count = std::clamp(static_cast<int>(std::lround(half * 2.0f / 11.0f)), 2, 7);
+            if (round) {
+                // Evenly around the ellipse, each ray facing straight out.
+                const float around = pi * (halfX + halfY);  // roughly the distance around
+                const int   count = std::clamp(static_cast<int>(std::lround(around / 11.0f)), 6, 14);
                 for (int i = 0; i < count; ++i) {
-                    auto* node = RE::NiNode::Create(1);
-                    auto* ray = CloneModel(rayTemplate);
-                    if (!node || !ray) {
-                        continue;
-                    }
-                    const float along = -half + (i + 0.5f) * (2.0f * half / count);  // position along the side
-                    const float t = along / half;                                    // -1 .. 1
-                    // Position: on the side, facing outward ("out" is -Y before turning).
-                    const float a = sides[side].yaw;
-                    const float px = along, py = -(side < 2 ? halfY : halfX);
-                    node->name = "ChestGlowRay";
-                    node->local.translate.x = px * std::cos(a) - py * std::sin(a);
-                    node->local.translate.y = px * std::sin(a) + py * std::cos(a);
-                    node->local.translate.z = 0.0f;
-
-                    Ray r;
-                    r.node.reset(node);
-                    r.yaw = a;
-                    r.tilt = 0.35f;                                         // lean away from the chest
-                    r.lean = t * 0.35f;                                     // fan out toward the ends
-                    r.height = 0.75f + 0.25f * std::cos(seed + i * 2.1f);  // vary heights a bit
-                    r.phase = seed * 0.37f + side * 1.9f + i * 2.3f;
-                    r.rate = 0.8f + 0.4f * std::fabs(std::sin(seed + side * 3.1f + i * 1.7f));
-                    PoseRay(r, SecondsNow());
-
-                    ColorSeamModel(ray, g_settings.tiers[a_tier].color, &entry.materials);
-                    node->AttachChild(ray, true);
-                    holder->AttachChild(node, true);
-                    entry.rays.push_back(std::move(r));
+                    const float angle = 2.0f * pi * (i + 0.5f) / count;
+                    spots.push_back({ halfX * std::cos(angle), halfY * std::sin(angle), angle + pi * 0.5f, 0.0f });
                 }
+            } else {
+                // Along each of the four sides, fanning out toward the ends.
+                struct Side
+                {
+                    float halfLength;  // half the side's length
+                    float yaw;         // turns the ray to face outward from this side
+                    float offset;      // distance from the center to this side
+                };
+                const Side sides[4] = { { halfX, 0.0f, halfY }, { halfX, pi, halfY }, { halfY, pi * 0.5f, halfX },
+                    { halfY, -pi * 0.5f, halfX } };
+                for (const auto& side : sides) {
+                    const int count = std::clamp(static_cast<int>(std::lround(side.halfLength * 2.0f / 11.0f)), 2, 7);
+                    for (int i = 0; i < count; ++i) {
+                        const float along = -side.halfLength + (i + 0.5f) * (2.0f * side.halfLength / count);
+                        const float px = along, py = -side.offset;  // "out" is -Y before turning
+                        spots.push_back({ px * std::cos(side.yaw) - py * std::sin(side.yaw),
+                            px * std::sin(side.yaw) + py * std::cos(side.yaw), side.yaw, along / side.halfLength * 0.35f });
+                    }
+                }
+            }
+
+            for (std::size_t i = 0; i < spots.size(); ++i) {
+                auto* node = RE::NiNode::Create(1);
+                auto* ray = CloneModel(rayTemplate);
+                if (!node || !ray) {
+                    continue;
+                }
+                const auto& spot = spots[i];
+                const float k = static_cast<float>(i);
+                node->name = "ChestGlowRay";
+                node->local.translate.x = spot.x;
+                node->local.translate.y = spot.y;
+                node->local.translate.z = 0.0f;
+
+                Ray r;
+                r.node.reset(node);
+                r.yaw = spot.yaw;
+                r.tilt = 0.35f;                                         // lean away from the container
+                r.lean = spot.lean;                                     // fan out toward the ends
+                r.height = 0.75f + 0.25f * std::cos(seed + k * 2.1f);  // vary heights a bit
+                r.phase = seed * 0.37f + k * 2.3f;
+                r.rate = 0.8f + 0.4f * std::fabs(std::sin(seed + k * 1.7f));
+                PoseRay(r, SecondsNow());
+
+                ColorSeamModel(ray, g_settings.tiers[a_tier].color, &entry.materials);
+                node->AttachChild(ray, true);
+                holder->AttachChild(node, true);
+                entry.rays.push_back(std::move(r));
             }
         }
 
@@ -1429,12 +1506,22 @@ namespace
     void StartScanner()
     {
         std::thread([]() {
+            float waited = 0.0f;  // seconds spent waiting for the "save loaded" signal
             for (;;) {
-                const auto ms = static_cast<int>(g_settings.scanInterval * 1000.0f);
-                std::this_thread::sleep_for(std::chrono::milliseconds(std::max(500, ms)));
+                const auto ms = std::max(500, static_cast<int>(g_settings.scanInterval * 1000.0f));
+                std::this_thread::sleep_for(std::chrono::milliseconds(ms));
                 if (!g_inWorld) {
+                    // Normally the "save loaded" signal switches scanning on. If it never comes,
+                    // switch on anyway after a while (the scan itself skips menus and loading screens).
+                    waited += ms / 1000.0f;
+                    if (waited >= 10.0f) {
+                        Log("No 'save loaded' signal received; starting the nearby scan anyway.");
+                        g_logNextScan = true;
+                        g_inWorld = true;
+                    }
                     continue;
                 }
+                waited = 0.0f;
                 if (g_scansToSkip > 0) {
                     --g_scansToSkip;
                     continue;

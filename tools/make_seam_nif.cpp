@@ -8,6 +8,9 @@
 //   Band   - a thin glowing strip all the way around the seam
 //   Flares - horizontal streaks leaking out past the ends of the seam
 //
+// SeamRing<Tier>.nif is a round band (a 1-wide circle) for barrels and other
+// round containers, also stretched to the container's size by the plugin.
+//
 // SeamRay<Tier>.nif is ONE light ray in normal game units. The plugin places
 // several copies along the seam and makes them sway ("dance") separately.
 
@@ -110,6 +113,24 @@ namespace
 		return m;
 	}
 
+	// A round band: 32 segments around a circle 1 unit across.
+	Mesh MakeRingBand()
+	{
+		Mesh             m;
+		constexpr int    segments = 32;
+		constexpr float  twoPi = 6.2831853f;
+		const float      h = BAND_HEIGHT * 0.5f;
+		for (int i = 0; i < segments; ++i) {
+			const float a0 = twoPi * i / segments, a1 = twoPi * (i + 1) / segments;
+			const Vector3 p0{ 0.5f * std::cos(a0), 0.5f * std::sin(a0), 0.0f };
+			const Vector3 p1{ 0.5f * std::cos(a1), 0.5f * std::sin(a1), 0.0f };
+			const float u0 = static_cast<float>(i) / segments, u1 = static_cast<float>(i + 1) / segments;
+			m.Quad({ p0.x, p0.y, -h }, { p1.x, p1.y, -h }, { p1.x, p1.y, h }, { p0.x, p0.y, h },
+				{ u0, 1 }, { u1, 1 }, { u1, 0 }, { u0, 0 });
+		}
+		return m;
+	}
+
 	Mesh MakeFlares()
 	{
 		Mesh m;
@@ -179,6 +200,15 @@ namespace
 		return Save(nif, path);
 	}
 
+	bool BuildRing(const std::string& path, Color4 color)
+	{
+		NifFile nif;
+		nif.Create(NiVersion::getSSE());
+		nif.GetRootNode()->name.get() = "ChestGlowSeamRing";
+		AddPart(nif, "Band", MakeRingBand(), "textures\\ChestGlow\\SeamBand.dds", color);
+		return Save(nif, path);
+	}
+
 	bool Build(const std::string& path, Color4 color)
 	{
 		NifFile nif;
@@ -203,6 +233,9 @@ int main(int argc, char** argv)
 	ok &= BuildRay(dir + "/SeamRayLegendary.nif", Color4(1.0f, 0.78f, 0.0f, 1.0f));
 	ok &= BuildRay(dir + "/SeamRayEpic.nif", Color4(0.67f, 0.24f, 1.0f, 1.0f));
 	ok &= BuildRay(dir + "/SeamRayCommon.nif", Color4(0.24f, 0.86f, 0.31f, 1.0f));
-	std::printf(ok ? "Saved 6 models.\n" : "FAILED to save.\n");
+	ok &= BuildRing(dir + "/SeamRingLegendary.nif", Color4(1.0f, 0.78f, 0.0f, 1.0f));
+	ok &= BuildRing(dir + "/SeamRingEpic.nif", Color4(0.67f, 0.24f, 1.0f, 1.0f));
+	ok &= BuildRing(dir + "/SeamRingCommon.nif", Color4(0.24f, 0.86f, 0.31f, 1.0f));
+	std::printf(ok ? "Saved 9 models.\n" : "FAILED to save.\n");
 	return ok ? 0 : 1;
 }
