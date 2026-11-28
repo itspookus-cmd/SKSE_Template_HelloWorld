@@ -4,10 +4,12 @@
 // is stretched to each chest's real size by the plugin. Heights (Z) are in
 // normal game units, centered on the seam (Z = 0).
 //
-// Parts:
+// Seam<Tier>.nif parts (stretched to the chest by the plugin):
 //   Band   - a thin glowing strip all the way around the seam
-//   Rays   - soft light rays rising from the seam on every side
 //   Flares - horizontal streaks leaking out past the ends of the seam
+//
+// SeamRay<Tier>.nif is ONE light ray in normal game units. The plugin places
+// several copies along the seam and makes them sway ("dance") separately.
 
 #include "NifFile.hpp"
 
@@ -77,7 +79,18 @@ namespace
 		return m;
 	}
 
-	Mesh MakeRays()
+	// One ray in game units: base centered at the origin, rising along +Z,
+	// lying flat in the X/Z plane, facing -Y (the plugin turns it to face outward).
+	Mesh MakeSingleRay()
+	{
+		Mesh m;
+		const float baseHalf = 2.5f;
+		const float topHalf = 6.0f;
+		m.Quad({ -baseHalf, 0.0f, -1.0f }, { baseHalf, 0.0f, -1.0f }, { topHalf, 0.0f, RAY_HEIGHT }, { -topHalf, 0.0f, RAY_HEIGHT });
+		return m;
+	}
+
+	[[maybe_unused]] Mesh MakeRays()
 	{
 		Mesh m;
 		for (auto& s : SIDES) {
@@ -113,15 +126,16 @@ namespace
 		return m;
 	}
 
-	void AddPart(NifFile& nif, const std::string& name, const Mesh& mesh, const std::string& texture, Color4 color)
+	void AddPart(NifFile& nif, const std::string& name, const Mesh& mesh, const std::string& texture, Color4 color,
+		Vector3 boundsCenter = Vector3(0.0f, 0.0f, RAY_HEIGHT * 0.3f), float boundsRadius = 80.0f)
 	{
 		NiShape* shape = nif.CreateShapeFromData(name, &mesh.verts, &mesh.tris, &mesh.uvs, nullptr);
 
 		// The plugin stretches this 1x1 model to the chest's size, so give it a
 		// generous size for the game's "is it on screen?" check.
 		BoundingSphere bounds;
-		bounds.center = Vector3(0.0f, 0.0f, RAY_HEIGHT * 0.3f);
-		bounds.radius = 80.0f;
+		bounds.center = boundsCenter;
+		bounds.radius = boundsRadius;
 		shape->SetBounds(bounds);
 
 		// Swap the default lighting shader for a glowing "effect" shader.
@@ -146,6 +160,25 @@ namespace
 		nif.AssignAlphaProperty(shape, std::move(alpha));
 	}
 
+	bool Save(NifFile& nif, const std::string& path)
+	{
+		nif.DeleteUnreferencedBlocks();  // drops the unused default shaders
+
+		NifSaveOptions options;
+		options.optimize = false;  // keep our generous bounds (optimizing would recalculate them)
+		return nif.Save(path, options) == 0;
+	}
+
+	bool BuildRay(const std::string& path, Color4 color)
+	{
+		NifFile nif;
+		nif.Create(NiVersion::getSSE());
+		nif.GetRootNode()->name.get() = "ChestGlowRay";
+		AddPart(nif, "Ray", MakeSingleRay(), "textures\\ChestGlow\\SeamRay.dds", color,
+			Vector3(0.0f, 0.0f, RAY_HEIGHT * 0.5f), RAY_HEIGHT);
+		return Save(nif, path);
+	}
+
 	bool Build(const std::string& path, Color4 color)
 	{
 		NifFile nif;
@@ -153,14 +186,9 @@ namespace
 		nif.GetRootNode()->name.get() = "ChestGlowSeam";
 
 		AddPart(nif, "Band", MakeBand(), "textures\\ChestGlow\\SeamBand.dds", color);
-		AddPart(nif, "Rays", MakeRays(), "textures\\ChestGlow\\SeamRay.dds", color);
 		AddPart(nif, "Flares", MakeFlares(), "textures\\ChestGlow\\SeamFlare.dds", color);
 
-		nif.DeleteUnreferencedBlocks();  // drops the unused default shaders
-
-		NifSaveOptions options;
-		options.optimize = false;  // keep our generous bounds (optimizing would recalculate them)
-		return nif.Save(path, options) == 0;
+		return Save(nif, path);
 	}
 }
 
@@ -172,6 +200,9 @@ int main(int argc, char** argv)
 	ok &= Build(dir + "/SeamLegendary.nif", Color4(1.0f, 0.78f, 0.0f, 1.0f));
 	ok &= Build(dir + "/SeamEpic.nif", Color4(0.67f, 0.24f, 1.0f, 1.0f));
 	ok &= Build(dir + "/SeamCommon.nif", Color4(0.24f, 0.86f, 0.31f, 1.0f));
-	std::printf(ok ? "Saved 3 models.\n" : "FAILED to save.\n");
+	ok &= BuildRay(dir + "/SeamRayLegendary.nif", Color4(1.0f, 0.78f, 0.0f, 1.0f));
+	ok &= BuildRay(dir + "/SeamRayEpic.nif", Color4(0.67f, 0.24f, 1.0f, 1.0f));
+	ok &= BuildRay(dir + "/SeamRayCommon.nif", Color4(0.24f, 0.86f, 0.31f, 1.0f));
+	std::printf(ok ? "Saved 6 models.\n" : "FAILED to save.\n");
 	return ok ? 0 : 1;
 }

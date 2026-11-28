@@ -80,10 +80,15 @@ namespace
 
         bool  seamLight = true;           // true = glowing seam with rays, false = whole chest glows
         float seamGlowStrength = 2.0f;    // how bright the seam glow and rays are
+        bool  seamPulse = true;           // fade the seam glow up and down
+        float pulseTime = 4.0f;           // seconds to fade from off to full (and back)
+        bool  raysDance = true;           // rays sway and stretch on their own
+        float danceSpeed = 1.0f;          // how fast the rays move
+        float danceAmount = 1.0f;         // how far the rays move
         bool  lightSurroundings = false;  // also shine real light onto the floor and walls
         float lightRadius = 200.0f;       // how far that light reaches (game units)
         float lightBrightness = 1.5f;     // how bright that light is
-        float seamHeight = 0.6f;        // where the seam is, as a share of the chest's height (0 = bottom, 1 = top)
+        float seamHeight = 0.78f;       // where the seam is, as a share of the chest's height (0 = bottom, 1 = top)
 
         float     glowStrength = 1.0f;                  // 0.0 (faint) to 1.0 (strong)
         float     pulseSpeed = 1.0f;                    // how fast the glow breathes; 0 = steady
@@ -195,6 +200,11 @@ namespace
         }
         g_settings.seamGlowStrength = std::clamp(getFloat("seamglowstrength", g_settings.seamGlowStrength), 0.1f, 10.0f);
         g_settings.lightSurroundings = getBool("lightsurroundings", g_settings.lightSurroundings);
+        g_settings.seamPulse = getBool("seampulse", g_settings.seamPulse);
+        g_settings.pulseTime = std::clamp(getFloat("pulsetime", g_settings.pulseTime), 0.5f, 15.0f);
+        g_settings.raysDance = getBool("raysdance", g_settings.raysDance);
+        g_settings.danceSpeed = std::clamp(getFloat("dancespeed", g_settings.danceSpeed), 0.1f, 5.0f);
+        g_settings.danceAmount = std::clamp(getFloat("danceamount", g_settings.danceAmount), 0.0f, 3.0f);
         g_settings.lightRadius = std::clamp(getFloat("lightradius", g_settings.lightRadius), 30.0f, 1000.0f);
         g_settings.lightBrightness = std::clamp(getFloat("lightbrightness", g_settings.lightBrightness), 0.1f, 10.0f);
         g_settings.seamHeight = std::clamp(getFloat("seamheight", g_settings.seamHeight), 0.0f, 1.0f);
@@ -252,6 +262,13 @@ namespace
              << "GlowStyle = " << (g_settings.seamLight ? "Seam" : "Whole") << "\n"
              << "; How bright the seam glow and rays are.\n"
              << "SeamGlowStrength = " << g_settings.seamGlowStrength << "\n"
+             << "; Fade the seam glow from off to full and back. PulseTime = seconds for one fade.\n"
+             << "SeamPulse = " << b(g_settings.seamPulse) << "\n"
+             << "PulseTime = " << g_settings.pulseTime << "\n"
+             << "; Make the light rays sway and stretch. Speed: 1 = normal. Amount: 1 = normal, 0 = still.\n"
+             << "RaysDance = " << b(g_settings.raysDance) << "\n"
+             << "DanceSpeed = " << g_settings.danceSpeed << "\n"
+             << "DanceAmount = " << g_settings.danceAmount << "\n"
              << "; Also shine real colored light onto the floor and walls around the chest.\n"
              << "LightSurroundings = " << b(g_settings.lightSurroundings) << "\n"
              << "; That light: how far it reaches (about 70 = 1 meter) and how bright it is.\n"
@@ -600,12 +617,26 @@ namespace
         func(shadowSceneNode, a_light);
     }
 
+    // One light ray on a chest, and how it moves.
+    struct Ray
+    {
+        RE::NiPointer<RE::NiNode> node;
+        float                     yaw = 0.0f;     // which way it faces (outward from its side)
+        float                     tilt = 0.0f;    // how far its top leans away from the chest
+        float                     lean = 0.0f;    // fans out toward the chest's ends
+        float                     height = 1.0f;  // its normal size
+        float                     phase = 0.0f;   // so rays don't all move together
+        float                     rate = 1.0f;    // each ray moves at a slightly different pace
+    };
+
     struct SeamLight
     {
         RE::NiPointer<RE::NiNode>     node;
         RE::NiPointer<RE::NiAVObject> light;
         RE::NiAVObject*               root = nullptr;  // the chest model it was attached to
         int                           tier = NO_TIER;
+        std::vector<Ray>              rays;
+        std::vector<RE::BSEffectShaderMaterial*> materials;  // for the pulse
     };
     std::unordered_map<RE::FormID, SeamLight> g_seamLights;  // main thread only
 
@@ -648,8 +679,15 @@ namespace
         "ChestGlow\\SeamEpic.nif",
         "ChestGlow\\SeamCommon.nif",
     };
+    const char* RAY_MODELS[TIER_COUNT] = {
+        "ChestGlow\\SeamRayLegendary.nif",
+        "ChestGlow\\SeamRayEpic.nif",
+        "ChestGlow\\SeamRayCommon.nif",
+    };
     RE::NiPointer<RE::NiNode> g_seamTemplates[TIER_COUNT];
+    RE::NiPointer<RE::NiNode> g_rayTemplates[TIER_COUNT];
     bool                      g_seamModelMissing = false;
+    bool                      g_rayModelMissing = false;
 
     // The game's own model loader and copier (same ones Light Placer uses).
     RE::NiNode* LoadModel(const char* a_path)
@@ -701,8 +739,84 @@ namespace
         return g_seamTemplates[a_tier].get();
     }
 
-    // Recolors every glowing part of a seam model.
-    void ColorSeamModel(RE::NiAVObject* a_model, RE::Color a_color)
+    RE::NiNode* GetRayTemplate(int a_tier)
+    {
+        if (!g_rayTemplates[a_tier] && !g_rayModelMissing) {
+            auto* model = LoadModel(RAY_MODELS[a_tier]);
+            if (!model) {
+                g_rayModelMissing = true;
+                Log(std::string("ERROR: could not load meshes\\") + RAY_MODELS[a_tier] + ". The seam will glow without rays.");
+                return nullptr;
+            }
+            g_rayTemplates[a_tier].reset(model);
+            model->DecRefCount();
+            Log(std::string("Loaded ray model ") + RAY_MODELS[a_tier]);
+        }
+        return g_rayTemplates[a_tier].get();
+    }
+
+    // ---- Rotation helpers (for placing and moving the rays) ----
+    RE::NiMatrix3 RotX(float a)
+    {
+        RE::NiMatrix3 m;
+        const float   c = std::cos(a), s = std::sin(a);
+        m.entry[1][1] = c, m.entry[1][2] = -s, m.entry[2][1] = s, m.entry[2][2] = c;
+        return m;
+    }
+    RE::NiMatrix3 RotY(float a)
+    {
+        RE::NiMatrix3 m;
+        const float   c = std::cos(a), s = std::sin(a);
+        m.entry[0][0] = c, m.entry[0][2] = s, m.entry[2][0] = -s, m.entry[2][2] = c;
+        return m;
+    }
+    RE::NiMatrix3 RotZ(float a)
+    {
+        RE::NiMatrix3 m;
+        const float   c = std::cos(a), s = std::sin(a);
+        m.entry[0][0] = c, m.entry[0][1] = -s, m.entry[1][0] = s, m.entry[1][1] = c;
+        return m;
+    }
+
+    float SecondsNow()
+    {
+        using clock = std::chrono::steady_clock;
+        static const auto start = clock::now();
+        return std::chrono::duration<float>(clock::now() - start).count();
+    }
+
+    // Puts a ray in its pose for time a_time: swaying side to side and stretching up and down.
+    void PoseRay(Ray& a_ray, float a_time)
+    {
+        float sway = 0.0f;
+        float stretch = 1.0f;
+        if (g_settings.raysDance && g_settings.danceAmount > 0.0f) {
+            const float t = a_time * g_settings.danceSpeed * a_ray.rate;
+            const float amount = g_settings.danceAmount;
+            // Two waves mixed together so the motion doesn't look mechanical.
+            sway = amount * 0.22f * (std::sin(t * 1.7f + a_ray.phase) * 0.7f + std::sin(t * 2.9f + a_ray.phase * 1.3f) * 0.3f);
+            stretch = 1.0f + amount * 0.25f * std::sin(t * 1.3f + a_ray.phase * 0.7f);
+        }
+        auto& local = a_ray.node->local;
+        local.rotate = RotZ(a_ray.yaw) * RotX(a_ray.tilt) * RotY(a_ray.lean + sway);
+        local.scale = std::max(0.1f, a_ray.height * stretch);
+    }
+
+    // Glow brightness for time a_time: a smooth fade from off to full and back.
+    float PulseBrightness(float a_time)
+    {
+        if (!g_settings.seamPulse) {
+            return g_settings.seamGlowStrength;
+        }
+        constexpr float pi = 3.14159265f;
+        const float     cycle = 2.0f * g_settings.pulseTime;  // up and back down
+        const float     wave = 0.5f - 0.5f * std::cos(2.0f * pi * std::fmod(a_time, cycle) / cycle);
+        return g_settings.seamGlowStrength * wave;
+    }
+
+    // Recolors every glowing part of a seam model (and lists its materials, for the pulse).
+    void ColorSeamModel(RE::NiAVObject* a_model, RE::Color a_color,
+        std::vector<RE::BSEffectShaderMaterial*>* a_materials = nullptr)
     {
         RE::BSVisit::TraverseScenegraphGeometries(a_model, [&](RE::BSGeometry* a_geometry) {
             auto& props = a_geometry->GetGeometryRuntimeData().properties;
@@ -713,7 +827,10 @@ namespace
                 material->baseColor.green = a_color.green / 255.0f;
                 material->baseColor.blue = a_color.blue / 255.0f;
                 material->baseColor.alpha = 1.0f;
-                material->baseColorScale = g_settings.seamGlowStrength;
+                material->baseColorScale = PulseBrightness(SecondsNow());
+                if (a_materials) {
+                    a_materials->push_back(material);
+                }
             }
             return RE::BSVisit::BSVisitControl::kContinue;
         });
@@ -741,7 +858,7 @@ namespace
         }
 
         // 'holder' sits at the seam. The light (if any) goes here.
-        auto* holder = RE::NiNode::Create(2);
+        auto* holder = RE::NiNode::Create(32);  // room for the glow, the rays and the light
         if (!holder) {
             return false;
         }
@@ -750,19 +867,71 @@ namespace
         holder->local.translate.y = (minY + maxY) * 0.5f;
         holder->local.translate.z = minZ + (maxZ - minZ) * g_settings.seamHeight;
 
+        SeamLight entry;
+        constexpr float margin = 0.6f;  // sit just outside the chest's surface
+
         // 'stretch' stretches the 1x1 seam model to the chest's width and depth
         // (heights stay in normal units, so the glow line keeps the same thickness).
         auto* stretch = RE::NiNode::Create(1);
         auto* glow = CloneModel(seamTemplate);
         if (stretch && glow) {
-            constexpr float margin = 0.6f;  // sit just outside the chest's surface
             stretch->name = "ChestGlowSeamStretch";
             stretch->local.rotate.entry[0][0] = (maxX - minX) + 2.0f * margin;
             stretch->local.rotate.entry[1][1] = (maxY - minY) + 2.0f * margin;
             stretch->local.rotate.entry[2][2] = 1.0f;
-            ColorSeamModel(glow, g_settings.tiers[a_tier].color);
+            ColorSeamModel(glow, g_settings.tiers[a_tier].color, &entry.materials);
             stretch->AttachChild(glow, true);
             holder->AttachChild(stretch, true);
+        }
+
+        // Light rays: separate copies placed along each side, so each can move on its own.
+        if (auto* rayTemplate = GetRayTemplate(a_tier)) {
+            constexpr float pi = 3.14159265f;
+            const float     halfX = (maxX - minX) * 0.5f + margin + 0.3f;
+            const float     halfY = (maxY - minY) * 0.5f + margin + 0.3f;
+            const float     seed = static_cast<float>(a_chest->GetFormID() % 997);
+            struct Side
+            {
+                float halfLength;  // half the side's length
+                float yaw;         // turns the ray to face outward from this side
+            };
+            const Side sides[4] = { { halfX, 0.0f }, { halfX, pi }, { halfY, pi * 0.5f }, { halfY, -pi * 0.5f } };
+
+            for (int side = 0; side < 4; ++side) {
+                const float half = sides[side].halfLength;
+                const int   count = std::clamp(static_cast<int>(std::lround(half * 2.0f / 11.0f)), 2, 7);
+                for (int i = 0; i < count; ++i) {
+                    auto* node = RE::NiNode::Create(1);
+                    auto* ray = CloneModel(rayTemplate);
+                    if (!node || !ray) {
+                        continue;
+                    }
+                    const float along = -half + (i + 0.5f) * (2.0f * half / count);  // position along the side
+                    const float t = along / half;                                    // -1 .. 1
+                    // Position: on the side, facing outward ("out" is -Y before turning).
+                    const float a = sides[side].yaw;
+                    const float px = along, py = -(side < 2 ? halfY : halfX);
+                    node->name = "ChestGlowRay";
+                    node->local.translate.x = px * std::cos(a) - py * std::sin(a);
+                    node->local.translate.y = px * std::sin(a) + py * std::cos(a);
+                    node->local.translate.z = 0.0f;
+
+                    Ray r;
+                    r.node.reset(node);
+                    r.yaw = a;
+                    r.tilt = 0.35f;                                         // lean away from the chest
+                    r.lean = t * 0.35f;                                     // fan out toward the ends
+                    r.height = 0.75f + 0.25f * std::cos(seed + i * 2.1f);  // vary heights a bit
+                    r.phase = seed * 0.37f + side * 1.9f + i * 2.3f;
+                    r.rate = 0.8f + 0.4f * std::fabs(std::sin(seed + side * 3.1f + i * 1.7f));
+                    PoseRay(r, SecondsNow());
+
+                    ColorSeamModel(ray, g_settings.tiers[a_tier].color, &entry.materials);
+                    node->AttachChild(ray, true);
+                    holder->AttachChild(node, true);
+                    entry.rays.push_back(std::move(r));
+                }
+            }
         }
 
         root->AttachChild(holder, true);
@@ -775,13 +944,67 @@ namespace
             holder->Update(update);
         }
 
-        SeamLight entry;
         entry.node.reset(holder);
         entry.light.reset(light);
         entry.root = model;
         entry.tier = a_tier;
         g_seamLights[a_chest->GetFormID()] = std::move(entry);
         return true;
+    }
+
+    // ---- Animation: runs about 30 times a second on the game's main thread ----
+    void AnimateSeams()
+    {
+        if (g_seamLights.empty()) {
+            return;
+        }
+        if (auto* ui = RE::UI::GetSingleton(); ui && ui->GameIsPaused()) {
+            return;  // menus open: hold still
+        }
+        const float time = SecondsNow();
+        const float brightness = PulseBrightness(time);
+        const bool  dance = g_settings.raysDance && g_settings.danceAmount > 0.0f;
+        RE::NiUpdateData update{};
+
+        for (auto& [id, entry] : g_seamLights) {
+            if (!entry.node || !entry.node->parent) {
+                continue;  // its chest model went away; the scan will tidy it up
+            }
+            for (auto* material : entry.materials) {
+                material->baseColorScale = brightness;
+            }
+            if (dance) {
+                for (auto& ray : entry.rays) {
+                    PoseRay(ray, time);
+                    ray.node->Update(update);
+                }
+            }
+        }
+    }
+
+    std::atomic<bool> g_animateQueued{ false };
+
+    void StartAnimator()
+    {
+        std::thread([]() {
+            for (;;) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(33));
+                if (!g_settings.seamLight || (!g_settings.seamPulse && !g_settings.raysDance)) {
+                    continue;
+                }
+                if (g_animateQueued.exchange(true)) {
+                    continue;  // the last one hasn't run yet
+                }
+                if (auto* tasks = SKSE::GetTaskInterface()) {
+                    tasks->AddTask([]() {
+                        g_animateQueued = false;
+                        AnimateSeams();
+                    });
+                } else {
+                    g_animateQueued = false;
+                }
+            }
+        }).detach();
     }
 
     bool IsChest(RE::TESObjectREFR* a_ref)
@@ -1297,6 +1520,15 @@ namespace
 
             g_separatorText("Seam glow");
             changed |= g_sliderFloat("Seam glow brightness", &g_settings.seamGlowStrength, 0.1f, 10.0f, "%.1f", 0);
+            changed |= g_checkbox("Pulse (fade on and off)", &g_settings.seamPulse);
+            if (g_settings.seamPulse) {
+                g_sliderFloat("Pulse time (seconds from off to full)", &g_settings.pulseTime, 0.5f, 15.0f, "%.1f", 0);
+            }
+            changed |= g_checkbox("Dancing rays", &g_settings.raysDance);
+            if (g_settings.raysDance) {
+                g_sliderFloat("Dance speed", &g_settings.danceSpeed, 0.1f, 5.0f, "%.1f", 0);
+                g_sliderFloat("Dance amount", &g_settings.danceAmount, 0.0f, 3.0f, "%.1f", 0);
+            }
             changed |= g_sliderFloat("Seam height (0 = bottom, 1 = top)", &g_settings.seamHeight, 0.0f, 1.0f, "%.2f", 0);
             changed |= g_checkbox("Also light up the floor and walls", &g_settings.lightSurroundings);
             if (g_settings.lightSurroundings) {
@@ -1409,6 +1641,7 @@ namespace
         events->AddEventSink<RE::TESActivateEvent>(&g_activateListener);
         events->AddEventSink<RE::TESCellAttachDetachEvent>(&g_cellAttachListener);
         StartScanner();
+        StartAnimator();
         Log("Chest Glow is running.");
 
         Menu::Register();
