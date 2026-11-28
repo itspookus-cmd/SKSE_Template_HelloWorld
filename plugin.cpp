@@ -87,7 +87,7 @@ namespace
         bool  raysDance = true;           // rays sway and stretch on their own
         float danceSpeed = 1.0f;          // how fast the rays move
         float danceAmount = 1.0f;         // how far the rays move
-        bool  lightSurroundings = false;  // also shine real light onto the floor and walls
+        bool  lightSurroundings = true;   // also shine real light onto the floor and walls
         float lightRadius = 200.0f;       // how far that light reaches (game units)
         float lightBrightness = 1.5f;     // how bright that light is
         float seamHeight = 0.78f;       // where the seam is, as a share of the chest's height (0 = bottom, 1 = top)
