@@ -665,6 +665,11 @@ namespace
         float                     rate = 1.0f;    // each ray moves at a slightly different pace
     };
 
+    // Containers around you that the nearby scan checks. Filled from the game's "area loaded"
+    // signal (see CellAttachListener below) and whenever a chest is seen any other way
+    // (pointed at, opened, items moved, came into view). Main thread only.
+    std::unordered_set<RE::FormID> g_nearbyContainers;
+
     struct SeamLight
     {
         RE::NiPointer<RE::NiNode>     node;
@@ -972,6 +977,7 @@ namespace
 
     void RememberLookedAt(RE::TESObjectREFR* a_chest)
     {
+        g_nearbyContainers.insert(a_chest->GetFormID());  // the scan will keep it glowing correctly
         auto* base = a_chest->GetBaseObject();
         auto* root = a_chest->Get3D();
         if (!base || !root) {
@@ -1265,6 +1271,8 @@ namespace
             return;  // not visible yet; the nearby scan will catch it once it is
         }
 
+        g_nearbyContainers.insert(a_chest->GetFormID());  // keep checking it from now on
+
         const ChestReport report = CheckChest(a_chest);
         LogCheck(a_chest, report, a_source);
         RememberReport(report);
@@ -1334,9 +1342,6 @@ namespace
         return result;
     }
 
-    // Containers in the loaded area around you. Filled from the game's "area loaded"
-    // signal (see CellAttachListener below). Main thread only.
-    std::unordered_set<RE::FormID> g_nearbyContainers;
 
     // Scanning only runs once a save is fully loaded, and pauses during loading screens.
     std::atomic<bool> g_inWorld{ false };
@@ -1905,7 +1910,9 @@ SKSEPluginLoad(const SKSE::LoadInterface* skse)
         case SKSE::MessagingInterface::kPreLoadGame:
             g_inWorld = false;  // pause scanning while a save loads
             RemoveAllSeamLights();
-            g_nearbyContainers.clear();
+            // Keep the container list: when a save loads in an area that's already loaded,
+            // the game doesn't announce its containers again. Old entries are harmless,
+            // since every check makes sure the chest is visible and close by.
             break;
         case SKSE::MessagingInterface::kPostLoadGame:
         case SKSE::MessagingInterface::kNewGame:
