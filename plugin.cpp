@@ -21,6 +21,8 @@
 #include <cstdarg>
 #include <fstream>
 #include <initializer_list>
+#include <cmath>
+#include <map>
 #include <mutex>
 #include <set>
 #include <sstream>
@@ -100,9 +102,15 @@ namespace
         float scanInterval = 2.0f;   // seconds between looks
 
         std::string glowTexture;  // optional: a texture path to use instead of the automatic pick
+
+        bool autoDetectSeam = true;  // find the seam from the chest model's lid
     };
 
     Settings g_settings;
+
+    // Your own seam heights per chest model (model path -> 0..1). Shared with the menu.
+    std::mutex                   g_seamTableLock;
+    std::map<std::string, float> g_modelSeamHeights;
 
     std::string Trim(std::string a_text)
     {
@@ -217,6 +225,24 @@ namespace
         if (auto it = values.find("glowtexture"); it != values.end()) {
             g_settings.glowTexture = it->second;
         }
+        g_settings.autoDetectSeam = getBool("autodetectseam", g_settings.autoDetectSeam);
+
+        // [SeamHeights]: any key that is a .nif model path.
+        {
+            std::scoped_lock guard(g_seamTableLock);
+            g_modelSeamHeights.clear();
+            for (auto& [key, value] : values) {
+                if (key.size() > 4 && key.ends_with(".nif")) {
+                    try {
+                        g_modelSeamHeights[key] = std::clamp(std::stof(value), 0.0f, 1.0f);
+                    } catch (...) {
+                    }
+                }
+            }
+            if (!g_modelSeamHeights.empty()) {
+                Log("Loaded your seam heights for " + std::to_string(g_modelSeamHeights.size()) + " chest model(s).");
+            }
+        }
 
         std::string summary = "Settings loaded.";
         for (const auto& tier : g_settings.tiers) {
@@ -291,7 +317,17 @@ namespace
              << "; How far around you the mod looks for containers (Skyrim units; about 70 = 1 meter).\n"
              << "ScanRadius = " << g_settings.scanRadius << "\n"
              << "; Seconds between looks.\n"
-             << "ScanInterval = " << g_settings.scanInterval << "\n";
+             << "ScanInterval = " << g_settings.scanInterval << "\n\n"
+             << "[SeamHeights]\n"
+             << "; Find each chest model's seam from its lid automatically.\n"
+             << "AutoDetectSeam = " << b(g_settings.autoDetectSeam) << "\n"
+             << "; Your own seam height per chest model (set these in-game from the menu).\n";
+        {
+            std::scoped_lock guard(g_seamTableLock);
+            for (auto& [model, height] : g_modelSeamHeights) {
+                file << model << " = " << height << "\n";
+            }
+        }
         Log("Settings saved to ChestGlow.ini.");
         return true;
     }
@@ -836,6 +872,122 @@ namespace
         });
     }
 
+    // ---- Seam height per chest model ----
+    std::string GetModelPath(RE::TESObjectREFR* a_chest)
+    {
+        auto* base = a_chest ? a_chest->GetBaseObject() : nullptr;
+        auto* container = base ? base->As<RE::TESObjectCONT>() : nullptr;
+        const char* model = container ? container->GetModel() : nullptr;
+        if (!model || !*model) {
+            return {};
+        }
+        std::string path = ToLower(model);
+        std::replace(path.begin(), path.end(), '/', '\\');
+        if (path.rfind("meshes\\", 0) == 0) {
+            path = path.substr(7);
+        }
+        return path;
+    }
+
+    // Looks for the lid in the chest's model. Its hinge sits at the seam.
+    // Returns the seam height (0..1), or NAN if no usable lid was found.
+    std::unordered_map<std::string, float> g_detectedSeams;  // main thread only
+
+    float DetectLidSeam(const std::string& a_model, RE::NiAVObject* a_root, float a_minZ, float a_maxZ)
+    {
+        if (auto it = g_detectedSeams.find(a_model); it != g_detectedSeams.end()) {
+            return it->second;
+        }
+        float       result = NAN;
+        std::string lidName;
+        if (a_root && a_maxZ > a_minZ) {
+            const auto&   rootWorld = a_root->world;
+            const auto    toLocal = rootWorld.rotate.Transpose();
+            const float   scale = rootWorld.scale > 0.0f ? rootWorld.scale : 1.0f;
+            RE::BSVisit::TraverseScenegraphObjects(a_root, [&](RE::NiAVObject* a_object) {
+                if (!a_object || a_object == a_root || a_object->name.empty()) {
+                    return RE::BSVisit::BSVisitControl::kContinue;
+                }
+                const std::string name = ToLower(a_object->name.c_str());
+                if (name.find("lid") == std::string::npos || name.find("chestglow") != std::string::npos) {
+                    return RE::BSVisit::BSVisitControl::kContinue;
+                }
+                const auto  local = toLocal * (a_object->world.translate - rootWorld.translate);
+                const float fraction = (local.z / scale - a_minZ) / (a_maxZ - a_minZ);
+                if (fraction > 0.2f && fraction < 0.98f) {
+                    result = fraction;
+                    lidName = a_object->name.c_str();
+                    return RE::BSVisit::BSVisitControl::kStop;
+                }
+                return RE::BSVisit::BSVisitControl::kContinue;
+            });
+        }
+        g_detectedSeams[a_model] = result;
+        Log("Seam for " + (a_model.empty() ? std::string("(unknown model)") : a_model) + ": " +
+            (std::isnan(result) ? std::string("no lid found") : ("lid '" + lidName + "' at " + std::to_string(result))));
+        return result;
+    }
+
+    enum class SeamSource
+    {
+        kYours,
+        kLid,
+        kDefault
+    };
+
+    float SeamHeightFor(RE::TESObjectREFR* a_chest, RE::NiAVObject* a_root, float a_minZ, float a_maxZ,
+        SeamSource* a_source = nullptr)
+    {
+        const std::string model = GetModelPath(a_chest);
+        if (!model.empty()) {
+            std::scoped_lock guard(g_seamTableLock);
+            if (auto it = g_modelSeamHeights.find(model); it != g_modelSeamHeights.end()) {
+                if (a_source) *a_source = SeamSource::kYours;
+                return it->second;
+            }
+        }
+        if (g_settings.autoDetectSeam) {
+            const float detected = DetectLidSeam(model, a_root, a_minZ, a_maxZ);
+            if (!std::isnan(detected)) {
+                if (a_source) *a_source = SeamSource::kLid;
+                return detected;
+            }
+        }
+        if (a_source) *a_source = SeamSource::kDefault;
+        return g_settings.seamHeight;
+    }
+
+    // What the menu shows about the chest you last pointed at.
+    struct LookedAtChest
+    {
+        bool        valid = false;
+        std::string name;
+        std::string model;
+        float       detected = NAN;
+        float       inUse = 0.0f;
+        SeamSource  source = SeamSource::kDefault;
+    };
+    std::mutex    g_lookedAtLock;
+    LookedAtChest g_lookedAt;
+
+    void RememberLookedAt(RE::TESObjectREFR* a_chest)
+    {
+        auto* base = a_chest->GetBaseObject();
+        auto* root = a_chest->Get3D();
+        if (!base || !root) {
+            return;
+        }
+        const auto& bounds = base->boundData;
+        LookedAtChest info;
+        info.valid = true;
+        info.name = a_chest->GetName() ? a_chest->GetName() : "";
+        info.model = GetModelPath(a_chest);
+        info.detected = DetectLidSeam(info.model, root, bounds.boundMin.z, bounds.boundMax.z);
+        info.inUse = SeamHeightFor(a_chest, root, bounds.boundMin.z, bounds.boundMax.z, &info.source);
+        std::scoped_lock guard(g_lookedAtLock);
+        g_lookedAt = info;
+    }
+
     // Adds the seam glow (and, if turned on, a real light) to a chest. Returns false if
     // the seam model isn't available, so the caller can fall back to the whole-chest glow.
     bool AddSeamLight(RE::TESObjectREFR* a_chest, int a_tier)
@@ -865,7 +1017,7 @@ namespace
         holder->name = "ChestGlowSeam";
         holder->local.translate.x = (minX + maxX) * 0.5f;
         holder->local.translate.y = (minY + maxY) * 0.5f;
-        holder->local.translate.z = minZ + (maxZ - minZ) * g_settings.seamHeight;
+        holder->local.translate.z = minZ + (maxZ - minZ) * SeamHeightFor(a_chest, model, minZ, maxZ);
 
         SeamLight entry;
         constexpr float margin = 0.6f;  // sit just outside the chest's surface
@@ -1371,6 +1523,33 @@ namespace
     };
 
     // Fires when something is activated, e.g. you open a chest.
+    // Fires when your crosshair moves onto something. We remember the last container,
+    // so the menu can show and adjust that chest model's seam height.
+    class CrosshairListener : public RE::BSTEventSink<SKSE::CrosshairRefEvent>
+    {
+    public:
+        RE::BSEventNotifyControl ProcessEvent(const SKSE::CrosshairRefEvent* a_event,
+            RE::BSTEventSource<SKSE::CrosshairRefEvent>*) override
+        {
+            if (!a_event || !a_event->crosshairRef) {
+                return RE::BSEventNotifyControl::kContinue;
+            }
+            auto* base = a_event->crosshairRef->GetBaseObject();
+            if (base && base->Is(RE::FormType::Container)) {
+                const auto id = a_event->crosshairRef->GetFormID();
+                if (auto* tasks = SKSE::GetTaskInterface()) {
+                    tasks->AddTask([id]() {
+                        if (auto* chest = RE::TESForm::LookupByID<RE::TESObjectREFR>(id); chest && chest->Is3DLoaded()) {
+                            RememberLookedAt(chest);
+                        }
+                    });
+                }
+            }
+            return RE::BSEventNotifyControl::kContinue;
+        }
+    };
+    CrosshairListener g_crosshairListener;
+
     class ActivateListener : public RE::BSTEventSink<RE::TESActivateEvent>
     {
     public:
@@ -1477,6 +1656,67 @@ namespace
 
         std::string g_saveMessage;
 
+        // "This chest type" section: seam height for the chest model you last pointed at.
+        bool RenderChestTypeSection()
+        {
+            LookedAtChest info;
+            {
+                std::scoped_lock guard(g_lookedAtLock);
+                info = g_lookedAt;
+            }
+            g_separatorText("Seam height for one chest type");
+            if (!info.valid || info.model.empty()) {
+                Text("Point your crosshair at a chest, then open this menu.");
+                return false;
+            }
+            Text("Chest you last pointed at: %s", info.name.c_str());
+            Text("Model: %s", info.model.c_str());
+            if (std::isnan(info.detected)) {
+                Text("Lid not found in this model.");
+            } else {
+                Text("Seam found from the lid: %.2f", info.detected);
+            }
+
+            bool  changed = false;
+            bool  hasOwn = false;
+            float height = info.inUse;
+            {
+                std::scoped_lock guard(g_seamTableLock);
+                if (auto it = g_modelSeamHeights.find(info.model); it != g_modelSeamHeights.end()) {
+                    hasOwn = true;
+                    height = it->second;
+                }
+            }
+            bool useOwn = hasOwn;
+            if (g_checkbox("Use my own seam height for this chest type", &useOwn)) {
+                std::scoped_lock guard(g_seamTableLock);
+                if (useOwn) {
+                    g_modelSeamHeights[info.model] = height;
+                } else {
+                    g_modelSeamHeights.erase(info.model);
+                }
+                changed = true;
+            }
+            if (useOwn) {
+                if (g_sliderFloat("Seam height for this chest type", &height, 0.0f, 1.0f, "%.2f", 0)) {
+                    std::scoped_lock guard(g_seamTableLock);
+                    g_modelSeamHeights[info.model] = height;
+                    changed = true;
+                }
+            } else {
+                const char* source = info.source == SeamSource::kLid ? "found from the lid" : "the default";
+                Text("Using %.2f (%s).", info.inUse, source);
+            }
+            if (changed) {
+                // Show the new height in the info right away.
+                std::scoped_lock guard(g_lookedAtLock);
+                g_lookedAt.source = useOwn ? SeamSource::kYours : (std::isnan(info.detected) || !g_settings.autoDetectSeam ? SeamSource::kDefault : SeamSource::kLid);
+                g_lookedAt.inUse = useOwn ? height : (g_lookedAt.source == SeamSource::kLid ? info.detected : g_settings.seamHeight);
+            }
+            Text("Press Save settings to keep it.");
+            return changed;
+        }
+
         void Render()
         {
             bool changed = false;
@@ -1529,7 +1769,9 @@ namespace
                 g_sliderFloat("Dance speed", &g_settings.danceSpeed, 0.1f, 5.0f, "%.1f", 0);
                 g_sliderFloat("Dance amount", &g_settings.danceAmount, 0.0f, 3.0f, "%.1f", 0);
             }
-            changed |= g_sliderFloat("Seam height (0 = bottom, 1 = top)", &g_settings.seamHeight, 0.0f, 1.0f, "%.2f", 0);
+            changed |= g_sliderFloat("Default seam height (0 = bottom, 1 = top)", &g_settings.seamHeight, 0.0f, 1.0f, "%.2f", 0);
+            changed |= g_checkbox("Find the seam from each chest's lid automatically", &g_settings.autoDetectSeam);
+            changed |= RenderChestTypeSection();
             changed |= g_checkbox("Also light up the floor and walls", &g_settings.lightSurroundings);
             if (g_settings.lightSurroundings) {
                 changed |= g_sliderFloat("Light reach", &g_settings.lightRadius, 30.0f, 1000.0f, "%.0f", 0);
@@ -1640,6 +1882,9 @@ namespace
         events->AddEventSink<RE::TESContainerChangedEvent>(&g_containerChangedListener);
         events->AddEventSink<RE::TESActivateEvent>(&g_activateListener);
         events->AddEventSink<RE::TESCellAttachDetachEvent>(&g_cellAttachListener);
+        if (auto* crosshair = SKSE::GetCrosshairRefEventSource()) {
+            crosshair->AddEventSink(&g_crosshairListener);
+        }
         StartScanner();
         StartAnimator();
         Log("Chest Glow is running.");
